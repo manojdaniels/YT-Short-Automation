@@ -30,3 +30,4 @@ streamlit run app.py
 ```
 
 The rendered videos are stored under the `generated` folder.
+"# YT-Short-Automation" 
