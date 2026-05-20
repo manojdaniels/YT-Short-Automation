@@ -798,11 +798,11 @@ def render_morph_section(image_files) -> None:
 
     if image_count < MORPH_MIN_IMAGES:
         st.info("Upload at least one image to create a video.")
-        st.button("Create Preview", disabled=True)
+        st.button("Create Preview", disabled=True, key="morph_preview_disabled_no_images")
         return
     if image_count > MORPH_MAX_IMAGES:
         st.error(f"Please upload no more than {MORPH_MAX_IMAGES} images.")
-        st.button("Create Preview", disabled=True)
+        st.button("Create Preview", disabled=True, key="morph_preview_disabled_too_many_images")
         return
 
     duration = (image_count * hold_seconds) + (max(0, image_count - 1) * transition_seconds)
@@ -837,7 +837,7 @@ def render_morph_section(image_files) -> None:
     preview_path = temp_dir / "image_transition_preview.mp4"
     final_path = temp_dir / f"{platform.lower().replace(' / ', '_').replace(' ', '_')}_{orientation.lower()}_final.mp4"
 
-    if st.button("Create Preview", type="primary"):
+    if st.button("Create Preview", type="primary", key="morph_create_preview"):
         with st.spinner("Rendering preview..."):
             image_paths = save_ordered_images(image_files, temp_dir / "source_images")
             render_morph_video(
@@ -862,8 +862,8 @@ def render_morph_section(image_files) -> None:
     if rendered_preview and rendered_preview.exists():
         st.subheader("Preview")
         st.video(str(rendered_preview))
-        approved = st.checkbox("I approve this preview and want to render the final MP4")
-        if approved and st.button("Generate Final MP4"):
+        approved = st.checkbox("I approve this preview and want to render the final MP4", key="morph_approve_final")
+        if approved and st.button("Generate Final MP4", key="morph_generate_final"):
             with st.spinner("Rendering final MP4... higher resolutions can take a while."):
                 image_paths = save_ordered_images(image_files, temp_dir / "source_images")
                 render_morph_video(
@@ -901,6 +901,7 @@ def render_morph_section(image_files) -> None:
                 data=file,
                 file_name=rendered_final.name,
                 mime="video/mp4",
+                key="morph_download_final",
             )
 
 
@@ -965,7 +966,7 @@ def render_section(details: VideoDetails, style: TextStyle, background_file, mus
     preview_path = temp_dir / "preview.mp4"
     final_path = temp_dir / "youtube_short_final.mp4"
 
-    if st.button("Create Preview", type="primary"):
+    if st.button("Create Preview", type="primary", key="bible_create_preview"):
         with st.spinner("Rendering preview..."):
             render_video(background_path, text_overlay_path, audio_path, preview_path, min(details.duration, PREVIEW_DURATION_SECONDS), "2500k")
         st.session_state["preview_path"] = str(preview_path)
@@ -980,8 +981,8 @@ def render_section(details: VideoDetails, style: TextStyle, background_file, mus
         st.video(st.session_state["preview_path"])
 
     if st.session_state.get("final_ready_token") == token:
-        approved = st.checkbox("I approve this preview and want to generate the final MP4")
-        if approved and st.button("Generate Final MP4"):
+        approved = st.checkbox("I approve this preview and want to generate the final MP4", key="bible_approve_final")
+        if approved and st.button("Generate Final MP4", key="bible_generate_final"):
             with st.spinner("Rendering final YouTube Short..."):
                 render_video(background_path, text_overlay_path, audio_path, final_path, details.duration, "8000k")
             duration = probe_duration(final_path)
@@ -1005,6 +1006,7 @@ def render_section(details: VideoDetails, style: TextStyle, background_file, mus
                     data=file,
                     file_name="youtube_short_final.mp4",
                     mime="video/mp4",
+                    key="bible_download_final",
                 )
 
 
@@ -1083,7 +1085,7 @@ def main() -> None:
             render_section(details, style, background_file, music_file)
         else:
             st.info("Complete all fields above. The Create Preview button will appear after the image, music, date, Bible reference, and verse text are provided.")
-            st.button("Create Preview", disabled=True)
+            st.button("Create Preview", disabled=True, key="bible_preview_disabled_incomplete")
 
 
 if __name__ == "__main__":
