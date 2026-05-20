@@ -288,7 +288,8 @@ def main() -> None:
         )
         render_section(details, background_file, music_file)
     else:
-        st.info("Upload the background image, background music, date, Bible verse, and chapter details to begin.")
+        st.info("Complete all fields above. The Create Preview button will appear after the image, music, date, Bible reference, and verse text are provided.")
+        st.button("Create Preview", disabled=True)
 
 
 if __name__ == "__main__":
