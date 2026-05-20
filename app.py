@@ -164,6 +164,33 @@ def fit_image_to_canvas(image_path: Path, width: int, height: int) -> Image.Imag
     return image.crop((left, top, left + width, top + height))
 
 
+def contain_image_on_canvas(image_path: Path, width: int, height: int, background: str) -> Image.Image:
+    image = Image.open(image_path).convert("RGB")
+    scale = min(width / image.width, height / image.height)
+    fitted_width = max(1, int(image.width * scale))
+    fitted_height = max(1, int(image.height * scale))
+    fitted = image.resize((fitted_width, fitted_height), Image.Resampling.LANCZOS)
+
+    if background == "Blurred background":
+        canvas = fit_image_to_canvas(image_path, width, height).filter(ImageFilter.GaussianBlur(radius=max(12, width // 80)))
+        canvas = Image.blend(canvas, Image.new("RGB", (width, height), (0, 0, 0)), 0.35)
+    else:
+        canvas = Image.new("RGB", (width, height), (0, 0, 0))
+
+    left = (width - fitted_width) // 2
+    top = (height - fitted_height) // 2
+    canvas.paste(fitted, (left, top))
+    return canvas
+
+
+def prepare_canvas_image(image_path: Path, width: int, height: int, fit_mode: str) -> Image.Image:
+    if fit_mode == "Fill frame":
+        return fit_image_to_canvas(image_path, width, height)
+    if fit_mode == "Fit with blurred background":
+        return contain_image_on_canvas(image_path, width, height, "Blurred background")
+    return contain_image_on_canvas(image_path, width, height, "Black bars")
+
+
 def load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     candidates = [
         "C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf",
@@ -722,6 +749,71 @@ def glowing_fade_frame(first: Image.Image, second: Image.Image, alpha: float, gl
     return frame
 
 
+def add_highlight_bloom(image: Image.Image, strength: float) -> Image.Image:
+    if strength <= 0:
+        return image
+    arr = np.asarray(image, dtype=np.float32)
+    luminance = arr[:, :, 0] * 0.2126 + arr[:, :, 1] * 0.7152 + arr[:, :, 2] * 0.0722
+    mask = np.clip((luminance - 135) / 120, 0, 1)[:, :, None]
+    highlights = np.clip(arr * mask, 0, 255).astype(np.uint8)
+    highlight_image = Image.fromarray(highlights, "RGB")
+    bloom = highlight_image.filter(ImageFilter.GaussianBlur(radius=max(3, int(min(image.size) * 0.035 * strength))))
+    return Image.blend(image, Image.blend(image, bloom, 0.72), min(0.65, strength * 0.42))
+
+
+def add_vignette(image: Image.Image, amount: float) -> Image.Image:
+    if amount <= 0:
+        return image
+    width, height = image.size
+    y, x = np.ogrid[-1:1:height * 1j, -1:1:width * 1j]
+    radius = np.sqrt((x * 0.82) ** 2 + (y * 1.05) ** 2)
+    mask = np.clip((radius - 0.35) / 0.75, 0, 1)
+    factor = 1 - mask * amount
+    arr = np.asarray(image, dtype=np.float32)
+    arr *= factor[:, :, None]
+    return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), "RGB")
+
+
+def ken_burns_frame(image: Image.Image, progress: float, scene_index: int, intensity: float) -> Image.Image:
+    eased = smoothstep(progress)
+    direction = -1 if scene_index % 2 else 1
+    scale = 1 + intensity * (0.045 + 0.035 * eased)
+    width, height = image.size
+    scaled_width = max(width, int(width * scale))
+    scaled_height = max(height, int(height * scale))
+    enlarged = image.resize((scaled_width, scaled_height), Image.Resampling.LANCZOS)
+    max_x = scaled_width - width
+    max_y = scaled_height - height
+    pan_x = int(max_x * (0.5 + direction * (eased - 0.5) * 0.34))
+    pan_y = int(max_y * (0.5 + (0.5 - eased) * 0.18))
+    pan_x = max(0, min(max_x, pan_x))
+    pan_y = max(0, min(max_y, pan_y))
+    return enlarged.crop((pan_x, pan_y, pan_x + width, pan_y + height))
+
+
+def cinematic_morph_frame(
+    first: Image.Image,
+    second: Image.Image,
+    alpha: float,
+    scene_index: int,
+    glow_strength: float,
+) -> Image.Image:
+    eased = smoothstep(alpha)
+    wave = math.sin(math.pi * eased)
+    first_motion = ken_burns_frame(first, eased, scene_index, 1.0)
+    second_motion = ken_burns_frame(second, eased, scene_index + 1, 1.0)
+    base = Image.blend(first_motion, second_motion, eased)
+    base = add_highlight_bloom(base, glow_strength * (0.65 + wave * 0.9))
+
+    haze = base.filter(ImageFilter.GaussianBlur(radius=max(2, int(min(base.size) * 0.012 * (1 + wave)))))
+    base = Image.blend(base, haze, min(0.38, 0.12 + wave * 0.28))
+    warm_light = Image.new("RGB", base.size, (255, 224, 170))
+    cool_shadow = Image.new("RGB", base.size, (32, 52, 78))
+    base = Image.blend(base, cool_shadow, 0.04)
+    base = Image.blend(base, warm_light, min(0.16, wave * 0.16 * glow_strength))
+    return add_vignette(base, 0.22)
+
+
 def render_morph_video(
     image_paths: list[Path],
     output_path: Path,
@@ -733,8 +825,10 @@ def render_morph_video(
     glow_strength: float,
     bitrate: str,
     use_gpu: bool,
+    transition_style: str,
+    fit_mode: str,
 ) -> Path:
-    images = [fit_image_to_canvas(path, width, height) for path in image_paths]
+    images = [prepare_canvas_image(path, width, height, fit_mode) for path in image_paths]
     if not images:
         raise ValueError("At least one image is required.")
 
@@ -745,12 +839,18 @@ def render_morph_video(
         cursor = 0.0
         for index, image in enumerate(images):
             if time_value < cursor + hold_seconds or index == len(images) - 1:
+                hold_progress = (time_value - cursor) / max(0.001, hold_seconds) if hold_seconds else 1.0
+                if transition_style == "Cinematic morph":
+                    return np.asarray(add_vignette(ken_burns_frame(image, hold_progress, index, 1.0), 0.18))
                 return np.asarray(image)
             cursor += hold_seconds
 
             if time_value < cursor + transition_seconds:
                 alpha = (time_value - cursor) / max(0.001, transition_seconds)
-                frame = glowing_fade_frame(image, images[index + 1], alpha, glow_strength)
+                if transition_style == "Cinematic morph":
+                    frame = cinematic_morph_frame(image, images[index + 1], alpha, index, glow_strength)
+                else:
+                    frame = glowing_fade_frame(image, images[index + 1], alpha, glow_strength)
                 return np.asarray(frame)
             cursor += transition_seconds
         return np.asarray(images[-1])
@@ -765,21 +865,23 @@ def render_morph_video(
 def render_morph_section(image_files) -> None:
     WORK_DIR.mkdir(exist_ok=True)
     st.subheader("Image Morph Video")
-    st.caption("Upload images in order. The video holds on each image, then fades through a soft blue glow into the next one.")
+    st.caption("Upload images in order. The default cinematic style uses slow push-in motion, highlight bloom, and a long luminous dissolve between scenes.")
 
     platform = st.selectbox("Platform", list(VIDEO_DIMENSIONS.keys()))
     orientations = list(VIDEO_DIMENSIONS[platform].keys())
     orientation = st.radio("Video orientation", orientations, horizontal=True)
     width, height, preset_description = VIDEO_DIMENSIONS[platform][orientation]
     preview_width, preview_height = preview_dimensions(width, height)
+    transition_style = st.selectbox("Transition style", ["Cinematic morph", "Blue glow fade"], index=0)
+    fit_mode = st.selectbox("Image fit", ["Fit with black bars", "Fit with blurred background", "Fill frame"], index=0)
 
     col1, col2 = st.columns(2)
     with col1:
-        hold_seconds = st.slider("Hold per image", min_value=0.0, max_value=5.0, value=0.8, step=0.1)
+        hold_seconds = st.slider("Hold per image", min_value=0.0, max_value=5.0, value=1.0, step=0.1)
         fps = st.selectbox("Frame rate", [24, 30, 60], index=1)
     with col2:
-        transition_seconds = st.slider("Transition duration", min_value=0.5, max_value=6.0, value=2.0, step=0.1)
-        glow_strength = st.slider("Blue glow strength", min_value=0.0, max_value=1.6, value=0.9, step=0.1)
+        transition_seconds = st.slider("Transition duration", min_value=0.5, max_value=6.0, value=3.0, step=0.1)
+        glow_strength = st.slider("Glow strength", min_value=0.0, max_value=1.8, value=1.1, step=0.1)
 
     use_gpu = st.toggle("Use NVIDIA GPU encoding when available", value=True)
     gpu_ready = ffmpeg_supports_encoder("h264_nvenc")
@@ -814,6 +916,8 @@ def render_morph_section(image_files) -> None:
             "final_resolution": f"{width}x{height}",
             "preview_resolution": f"{preview_width}x{preview_height}",
             "preset": preset_description,
+            "transition": transition_style,
+            "image_fit": fit_mode,
             "fps": fps,
             "duration_seconds": round(duration, 2),
             "format": "MP4",
@@ -832,6 +936,8 @@ def render_morph_section(image_files) -> None:
         str(transition_seconds),
         str(glow_strength),
         str(use_gpu),
+        transition_style,
+        fit_mode,
     )
     temp_dir = WORK_DIR / f"morph_{token}"
     preview_path = temp_dir / "image_transition_preview.mp4"
@@ -851,6 +957,8 @@ def render_morph_section(image_files) -> None:
                 glow_strength,
                 "6000k",
                 use_gpu,
+                transition_style,
+                fit_mode,
             )
         st.session_state["morph_preview_path"] = str(preview_path)
         st.session_state["morph_preview_token"] = token
@@ -877,6 +985,8 @@ def render_morph_section(image_files) -> None:
                     glow_strength,
                     "45000k" if width >= MORPH_4K_WIDTH or height >= MORPH_4K_HEIGHT else "16000k",
                     use_gpu,
+                    transition_style,
+                    fit_mode,
                 )
             st.session_state["morph_final_path"] = str(final_path)
 
