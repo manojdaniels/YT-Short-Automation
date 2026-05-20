@@ -22,6 +22,9 @@ MAX_DURATION_SECONDS = 60
 PREVIEW_DURATION_SECONDS = 8
 FPS = 30
 WORK_DIR = Path("generated")
+TEXT_COLOR = (92, 47, 5)
+TEXT_STROKE = (255, 244, 216, 150)
+TEXT_SHADOW = (43, 24, 8, 125)
 
 
 @dataclass(frozen=True)
@@ -78,6 +81,20 @@ def load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFo
     return ImageFont.load_default()
 
 
+def load_serif_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    candidates = [
+        "C:/Windows/Fonts/georgiab.ttf" if bold else "C:/Windows/Fonts/georgia.ttf",
+        "C:/Windows/Fonts/timesbd.ttf" if bold else "C:/Windows/Fonts/times.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSerif-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation2/LiberationSerif-Regular.ttf",
+    ]
+    for candidate in candidates:
+        path = Path(candidate)
+        if path.exists():
+            return ImageFont.truetype(str(path), size)
+    return load_font(size, bold=bold)
+
+
 def wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_width: int) -> list[str]:
     words = text.split()
     lines: list[str] = []
@@ -97,6 +114,45 @@ def wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, m
     return lines
 
 
+def text_block_height(
+    draw: ImageDraw.ImageDraw,
+    lines: list[str],
+    font: ImageFont.ImageFont,
+    line_gap: int,
+) -> int:
+    if not lines:
+        return 0
+    heights = [draw.textbbox((0, 0), line, font=font)[3] - draw.textbbox((0, 0), line, font=font)[1] for line in lines]
+    return sum(heights) + line_gap * (len(lines) - 1)
+
+
+def fit_wrapped_text(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    max_width: int,
+    max_height: int,
+    start_size: int,
+    min_size: int,
+    bold: bool = False,
+    line_gap_ratio: float = 0.16,
+) -> tuple[ImageFont.ImageFont, list[str], int]:
+    for size in range(start_size, min_size - 1, -2):
+        font = load_serif_font(size, bold=bold)
+        line_gap = max(8, int(size * line_gap_ratio))
+        lines = wrap_text(draw, text, font, max_width)
+        if text_block_height(draw, lines, font, line_gap) <= max_height:
+            return font, lines, line_gap
+
+    font = load_serif_font(min_size, bold=bold)
+    line_gap = max(8, int(min_size * line_gap_ratio))
+    return font, wrap_text(draw, text, font, max_width), line_gap
+
+
+def format_reference(reference: str) -> str:
+    normalized = " ".join(reference.upper().split())
+    return normalized.replace(" :", ":").replace(": ", ":")
+
+
 def draw_centered_text(
     draw: ImageDraw.ImageDraw,
     lines: list[str],
@@ -104,11 +160,44 @@ def draw_centered_text(
     font: ImageFont.ImageFont,
     fill: tuple[int, int, int],
     line_gap: int,
+    stroke_width: int = 0,
+    stroke_fill: tuple[int, int, int] | None = None,
 ) -> int:
     for line in lines:
         bbox = draw.textbbox((0, 0), line, font=font)
         x = (WIDTH - (bbox[2] - bbox[0])) // 2
-        draw.text((x, y), line, font=font, fill=fill)
+        draw.text(
+            (x, y),
+            line,
+            font=font,
+            fill=fill,
+            stroke_width=stroke_width,
+            stroke_fill=stroke_fill,
+        )
+        y += bbox[3] - bbox[1] + line_gap
+    return y
+
+
+def draw_centered_text_with_contrast(
+    draw: ImageDraw.ImageDraw,
+    lines: list[str],
+    y: int,
+    font: ImageFont.ImageFont,
+    line_gap: int,
+    stroke_width: int,
+) -> int:
+    for line in lines:
+        bbox = draw.textbbox((0, 0), line, font=font)
+        x = (WIDTH - (bbox[2] - bbox[0])) // 2
+        draw.text((x + 3, y + 4), line, font=font, fill=TEXT_SHADOW)
+        draw.text(
+            (x, y),
+            line,
+            font=font,
+            fill=TEXT_COLOR,
+            stroke_width=stroke_width,
+            stroke_fill=TEXT_STROKE,
+        )
         y += bbox[3] - bbox[1] + line_gap
     return y
 
@@ -118,39 +207,48 @@ def create_frame(image_path: Path, details: VideoDetails, output_path: Path) -> 
     overlay = Image.new("RGBA", frame.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
 
-    # Soft top and bottom panels keep the verse readable over busy photos.
-    draw.rectangle((0, 0, WIDTH, 340), fill=(0, 0, 0, 112))
-    draw.rectangle((0, 1190, WIDTH, HEIGHT), fill=(0, 0, 0, 148))
-
-    date_font = load_font(48, bold=True)
-    ref_font = load_font(76, bold=True)
-    verse_font = load_font(58)
-
-    draw_centered_text(
+    date_font = load_serif_font(82, bold=True)
+    ref_font = load_serif_font(58, bold=True)
+    verse_text = details.verse_text.strip()
+    if not (verse_text.startswith('"') or verse_text.startswith("'")):
+        verse_text = f'"{verse_text}"'
+    verse_font, verse_lines, verse_gap = fit_wrapped_text(
         draw,
-        wrap_text(draw, details.date_text, date_font, 900),
-        116,
+        verse_text,
+        max_width=860,
+        max_height=670,
+        start_size=82,
+        min_size=58,
+        bold=True,
+        line_gap_ratio=0.1,
+    )
+    verse_height = text_block_height(draw, verse_lines, verse_font, verse_gap)
+    verse_y = max(570, 930 - (verse_height // 2))
+
+    draw_centered_text_with_contrast(
+        draw,
+        wrap_text(draw, details.date_text.upper(), date_font, 940),
+        245,
         date_font,
-        (255, 255, 255),
-        12,
+        18,
+        1,
     )
 
-    y = 1260
-    y = draw_centered_text(
+    draw_centered_text_with_contrast(
         draw,
-        wrap_text(draw, details.verse_reference, ref_font, 900),
-        y,
-        ref_font,
-        (255, 238, 178),
-        18,
-    )
-    draw_centered_text(
-        draw,
-        wrap_text(draw, details.verse_text, verse_font, 920),
-        y + 46,
+        verse_lines,
+        verse_y,
         verse_font,
-        (255, 255, 255),
-        20,
+        verse_gap,
+        1,
+    )
+    draw_centered_text_with_contrast(
+        draw,
+        wrap_text(draw, format_reference(details.verse_reference), ref_font, 900),
+        1690,
+        ref_font,
+        12,
+        1,
     )
 
     composed = Image.alpha_composite(frame.convert("RGBA"), overlay).convert("RGB")
