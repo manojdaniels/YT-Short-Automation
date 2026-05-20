@@ -30,4 +30,15 @@ streamlit run app.py
 ```
 
 The rendered videos are stored under the `generated` folder.
+
+## Streamlit Community Cloud
+
+Deploy with these settings:
+
+- Repository: your GitHub repository
+- Branch: `main`
+- Main file path: `app.py`
+
+Streamlit Community Cloud reads `requirements.txt` for Python packages and `packages.txt` for system packages. The `packages.txt` file installs FFmpeg, which is required for MP4 rendering.
+"# YT-Short-Automation" 
 "# YT-Short-Automation" 
