@@ -79,6 +79,9 @@ class TextStyle:
     reference_size: int
     glow_strength: int
     shadow_strength: int
+    show_date_box: bool
+    show_verse_box: bool
+    show_reference_box: bool
 
 
 def save_upload(uploaded_file, destination: Path) -> Path:
@@ -376,9 +379,12 @@ def create_text_overlay(details: VideoDetails, style: TextStyle, output_path: Pa
     glow_draw = ImageDraw.Draw(glow_layer)
     shadow_draw = ImageDraw.Draw(shadow_layer)
 
-    draw_translucent_box(box_draw, (170, 105, 910, 230), radius=0, scale=scale)
-    draw_translucent_box(box_draw, (105, 790, 975, 1375), radius=22, scale=scale)
-    draw_translucent_box(box_draw, (190, 1660, 890, 1775), radius=0, scale=scale)
+    if style.show_date_box:
+        draw_translucent_box(box_draw, (170, 105, 910, 230), radius=0, scale=scale)
+    if style.show_verse_box:
+        draw_translucent_box(box_draw, (105, 790, 975, 1375), radius=22, scale=scale)
+    if style.show_reference_box:
+        draw_translucent_box(box_draw, (190, 1660, 890, 1775), radius=0, scale=scale)
 
     date_font = load_named_font(style.date_size * scale, style.font_family, bold=True)
     ref_font = load_named_font(style.reference_size * scale, style.font_family, bold=True)
@@ -606,6 +612,9 @@ def style_digest(style: TextStyle) -> str:
             str(style.reference_size),
             str(style.glow_strength),
             str(style.shadow_strength),
+            str(style.show_date_box),
+            str(style.show_verse_box),
+            str(style.show_reference_box),
         ]
     )
 
@@ -700,6 +709,13 @@ def main() -> None:
             glow_strength = st.slider("Text clarity glow", min_value=0, max_value=6, value=2, step=1)
         with col5:
             shadow_strength = st.slider("Shadow strength", min_value=0, max_value=220, value=80, step=10)
+        box_col1, box_col2, box_col3 = st.columns(3)
+        with box_col1:
+            show_date_box = st.toggle("Date box", value=True)
+        with box_col2:
+            show_verse_box = st.toggle("Verse box", value=True)
+        with box_col3:
+            show_reference_box = st.toggle("Reference box", value=True)
 
     style = TextStyle(
         font_family=font_family,
@@ -710,6 +726,9 @@ def main() -> None:
         reference_size=reference_size,
         glow_strength=glow_strength,
         shadow_strength=shadow_strength,
+        show_date_box=show_date_box,
+        show_verse_box=show_verse_box,
+        show_reference_box=show_reference_box,
     )
 
     ready = all([background_file, music_file, date_text.strip(), verse_reference.strip(), verse_text.strip()])
