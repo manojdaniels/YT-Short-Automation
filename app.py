@@ -4,11 +4,12 @@ import hashlib
 import math
 import shutil
 import subprocess
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
 import streamlit as st
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 try:
     from moviepy import AudioFileClip, ImageClip
@@ -22,9 +23,31 @@ MAX_DURATION_SECONDS = 60
 PREVIEW_DURATION_SECONDS = 8
 FPS = 30
 WORK_DIR = Path("generated")
+FONT_CACHE_DIR = WORK_DIR / "fonts"
 TEXT_COLOR = (92, 47, 5)
 TEXT_STROKE = (255, 244, 216, 150)
 TEXT_SHADOW = (43, 24, 8, 125)
+TEXT_RENDER_SCALE = 2
+FONT_FAMILIES = [
+    "Serif",
+    "Playfair Display",
+    "Cinzel",
+    "Cormorant Garamond",
+    "Montserrat",
+    "Helvetica Neue",
+    "Sans Serif",
+    "Georgia",
+    "Times New Roman",
+    "Arial",
+    "DejaVu Serif",
+    "DejaVu Sans",
+]
+DOWNLOADABLE_FONTS = {
+    "Playfair Display": "https://raw.githubusercontent.com/google/fonts/main/ofl/playfairdisplay/PlayfairDisplay%5Bwght%5D.ttf",
+    "Cinzel": "https://raw.githubusercontent.com/google/fonts/main/ofl/cinzel/Cinzel%5Bwght%5D.ttf",
+    "Cormorant Garamond": "https://raw.githubusercontent.com/google/fonts/main/ofl/cormorantgaramond/CormorantGaramond%5Bwght%5D.ttf",
+    "Montserrat": "https://raw.githubusercontent.com/google/fonts/main/ofl/montserrat/Montserrat%5Bwght%5D.ttf",
+}
 
 
 @dataclass(frozen=True)
@@ -33,6 +56,18 @@ class VideoDetails:
     verse_reference: str
     verse_text: str
     duration: int
+
+
+@dataclass(frozen=True)
+class TextStyle:
+    font_family: str
+    text_color: str
+    glow_color: str
+    date_size: int
+    verse_size: int
+    reference_size: int
+    glow_strength: int
+    shadow_strength: int
 
 
 def save_upload(uploaded_file, destination: Path) -> Path:
@@ -95,6 +130,78 @@ def load_serif_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | I
     return load_font(size, bold=bold)
 
 
+def downloadable_font_path(family: str) -> Path | None:
+    url = DOWNLOADABLE_FONTS.get(family)
+    if not url:
+        return None
+
+    FONT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    font_path = FONT_CACHE_DIR / f"{family.replace(' ', '_')}.ttf"
+    if font_path.exists() and font_path.stat().st_size > 0:
+        return font_path
+
+    try:
+        with urllib.request.urlopen(url, timeout=12) as response:
+            font_bytes = response.read()
+        if font_bytes:
+            font_path.write_bytes(font_bytes)
+    except Exception:
+        if font_path.exists() and font_path.stat().st_size == 0:
+            font_path.unlink()
+        return None
+    return font_path if font_path.exists() and font_path.stat().st_size > 0 else None
+
+
+def load_named_font(size: int, family: str, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    serif_candidates = [
+        "C:/Windows/Fonts/georgiab.ttf" if bold else "C:/Windows/Fonts/georgia.ttf",
+        "C:/Windows/Fonts/timesbd.ttf" if bold else "C:/Windows/Fonts/times.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSerif-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation2/LiberationSerif-Regular.ttf",
+    ]
+    sans_candidates = [
+        "C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/segoeuib.ttf" if bold else "C:/Windows/Fonts/segoeui.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+    ]
+    candidates_by_family = {
+        "Georgia": ["C:/Windows/Fonts/georgiab.ttf" if bold else "C:/Windows/Fonts/georgia.ttf"],
+        "Times New Roman": ["C:/Windows/Fonts/timesbd.ttf" if bold else "C:/Windows/Fonts/times.ttf"],
+        "Arial": ["C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf"],
+        "Helvetica Neue": [
+            "/System/Library/Fonts/HelveticaNeue.ttc",
+            "/Library/Fonts/HelveticaNeue.ttc",
+            "C:/Windows/Fonts/HelveticaNeue.ttf",
+            "C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ],
+        "DejaVu Serif": ["/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf"],
+        "DejaVu Sans": ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"],
+        "Serif": serif_candidates,
+        "Sans Serif": sans_candidates,
+    }
+
+    downloaded = downloadable_font_path(family)
+    if downloaded:
+        try:
+            return ImageFont.truetype(str(downloaded), size)
+        except OSError:
+            pass
+
+    for candidate in candidates_by_family.get(family, serif_candidates):
+        path = Path(candidate)
+        if path.exists():
+            return ImageFont.truetype(str(path), size)
+    return load_serif_font(size, bold=bold) if family != "Sans Serif" else load_font(size, bold=bold)
+
+
+def hex_to_rgba(color: str, alpha: int = 255) -> tuple[int, int, int, int]:
+    color = color.lstrip("#")
+    return (int(color[0:2], 16), int(color[2:4], 16), int(color[4:6], 16), alpha)
+
+
 def wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_width: int) -> list[str]:
     words = text.split()
     lines: list[str] = []
@@ -133,17 +240,18 @@ def fit_wrapped_text(
     max_height: int,
     start_size: int,
     min_size: int,
+    family: str,
     bold: bool = False,
     line_gap_ratio: float = 0.16,
 ) -> tuple[ImageFont.ImageFont, list[str], int]:
     for size in range(start_size, min_size - 1, -2):
-        font = load_serif_font(size, bold=bold)
+        font = load_named_font(size, family, bold=bold)
         line_gap = max(8, int(size * line_gap_ratio))
         lines = wrap_text(draw, text, font, max_width)
         if text_block_height(draw, lines, font, line_gap) <= max_height:
             return font, lines, line_gap
 
-    font = load_serif_font(min_size, bold=bold)
+    font = load_named_font(min_size, family, bold=bold)
     line_gap = max(8, int(min_size * line_gap_ratio))
     return font, wrap_text(draw, text, font, max_width), line_gap
 
@@ -162,10 +270,11 @@ def draw_centered_text(
     line_gap: int,
     stroke_width: int = 0,
     stroke_fill: tuple[int, int, int] | None = None,
+    canvas_width: int = WIDTH,
 ) -> int:
     for line in lines:
         bbox = draw.textbbox((0, 0), line, font=font)
-        x = (WIDTH - (bbox[2] - bbox[0])) // 2
+        x = (canvas_width - (bbox[2] - bbox[0])) // 2
         draw.text(
             (x, y),
             line,
@@ -179,78 +288,123 @@ def draw_centered_text(
 
 
 def draw_centered_text_with_contrast(
-    draw: ImageDraw.ImageDraw,
+    text_draw: ImageDraw.ImageDraw,
+    glow_draw: ImageDraw.ImageDraw,
+    shadow_draw: ImageDraw.ImageDraw,
     lines: list[str],
     y: int,
     font: ImageFont.ImageFont,
     line_gap: int,
     stroke_width: int,
+    text_color: tuple[int, int, int, int],
+    glow_color: tuple[int, int, int, int],
+    shadow_color: tuple[int, int, int, int],
+    canvas_width: int,
 ) -> int:
     for line in lines:
-        bbox = draw.textbbox((0, 0), line, font=font)
-        x = (WIDTH - (bbox[2] - bbox[0])) // 2
-        draw.text((x + 3, y + 4), line, font=font, fill=TEXT_SHADOW)
-        draw.text(
+        bbox = text_draw.textbbox((0, 0), line, font=font)
+        x = (canvas_width - (bbox[2] - bbox[0])) // 2
+        shadow_draw.text((x + 8, y + 10), line, font=font, fill=shadow_color)
+        glow_draw.text(
             (x, y),
             line,
             font=font,
-            fill=TEXT_COLOR,
+            fill=glow_color,
             stroke_width=stroke_width,
-            stroke_fill=TEXT_STROKE,
+            stroke_fill=glow_color,
+        )
+        text_draw.text(
+            (x, y),
+            line,
+            font=font,
+            fill=text_color,
         )
         y += bbox[3] - bbox[1] + line_gap
     return y
 
 
-def create_frame(image_path: Path, details: VideoDetails, output_path: Path) -> Path:
+def create_frame(image_path: Path, details: VideoDetails, style: TextStyle, output_path: Path) -> Path:
     frame = fit_image_to_short(image_path)
-    overlay = Image.new("RGBA", frame.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
+    scale = TEXT_RENDER_SCALE
+    canvas_size = (WIDTH * scale, HEIGHT * scale)
+    text_layer = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
+    glow_layer = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
+    shadow_layer = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(text_layer)
+    glow_draw = ImageDraw.Draw(glow_layer)
+    shadow_draw = ImageDraw.Draw(shadow_layer)
 
-    date_font = load_serif_font(82, bold=True)
-    ref_font = load_serif_font(58, bold=True)
+    date_font = load_named_font(style.date_size * scale, style.font_family, bold=True)
+    ref_font = load_named_font(style.reference_size * scale, style.font_family, bold=True)
+    text_color = hex_to_rgba(style.text_color)
+    glow_color = hex_to_rgba(style.glow_color, alpha=185)
+    shadow_color = (0, 0, 0, max(0, min(255, style.shadow_strength)))
     verse_text = details.verse_text.strip()
     if not (verse_text.startswith('"') or verse_text.startswith("'")):
         verse_text = f'"{verse_text}"'
     verse_font, verse_lines, verse_gap = fit_wrapped_text(
         draw,
         verse_text,
-        max_width=860,
-        max_height=670,
-        start_size=82,
-        min_size=58,
+        max_width=860 * scale,
+        max_height=670 * scale,
+        start_size=style.verse_size * scale,
+        min_size=44 * scale,
+        family=style.font_family,
         bold=True,
         line_gap_ratio=0.1,
     )
     verse_height = text_block_height(draw, verse_lines, verse_font, verse_gap)
-    verse_y = max(570, 930 - (verse_height // 2))
+    verse_y = max(570 * scale, 930 * scale - (verse_height // 2))
 
     draw_centered_text_with_contrast(
         draw,
-        wrap_text(draw, details.date_text.upper(), date_font, 940),
-        245,
+        glow_draw,
+        shadow_draw,
+        wrap_text(draw, details.date_text.upper(), date_font, 940 * scale),
+        245 * scale,
         date_font,
-        18,
-        1,
+        18 * scale,
+        max(1, style.glow_strength * scale),
+        text_color,
+        glow_color,
+        shadow_color,
+        WIDTH * scale,
     )
 
     draw_centered_text_with_contrast(
         draw,
+        glow_draw,
+        shadow_draw,
         verse_lines,
         verse_y,
         verse_font,
         verse_gap,
-        1,
+        max(1, style.glow_strength * scale),
+        text_color,
+        glow_color,
+        shadow_color,
+        WIDTH * scale,
     )
     draw_centered_text_with_contrast(
         draw,
-        wrap_text(draw, format_reference(details.verse_reference), ref_font, 900),
-        1690,
+        glow_draw,
+        shadow_draw,
+        wrap_text(draw, format_reference(details.verse_reference), ref_font, 900 * scale),
+        1690 * scale,
         ref_font,
-        12,
-        1,
+        12 * scale,
+        max(1, style.glow_strength * scale),
+        text_color,
+        glow_color,
+        shadow_color,
+        WIDTH * scale,
     )
 
+    glow_layer = glow_layer.filter(ImageFilter.GaussianBlur(radius=max(1, style.glow_strength * scale)))
+    shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(radius=max(1, 2 * scale)))
+    overlay = Image.alpha_composite(shadow_layer, glow_layer)
+    overlay = Image.alpha_composite(overlay, text_layer)
+    overlay = overlay.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
     composed = Image.alpha_composite(frame.convert("RGBA"), overlay).convert("RGB")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     composed.save(output_path, quality=95)
@@ -309,13 +463,34 @@ def probe_duration(video_path: Path) -> float | None:
         return None
 
 
-def render_section(details: VideoDetails, background_file, music_file) -> None:
+def style_digest(style: TextStyle) -> str:
+    return "|".join(
+        [
+            style.font_family,
+            style.text_color,
+            style.glow_color,
+            str(style.date_size),
+            str(style.verse_size),
+            str(style.reference_size),
+            str(style.glow_strength),
+            str(style.shadow_strength),
+        ]
+    )
+
+
+def render_section(details: VideoDetails, style: TextStyle, background_file, music_file) -> None:
     WORK_DIR.mkdir(exist_ok=True)
-    token = file_digest(details.date_text, details.verse_reference, details.verse_text, str(details.duration))
+    token = file_digest(
+        details.date_text,
+        details.verse_reference,
+        details.verse_text,
+        str(details.duration),
+        style_digest(style),
+    )
     temp_dir = WORK_DIR / token
     image_path = save_upload(background_file, temp_dir / background_file.name)
     audio_path = save_upload(music_file, temp_dir / music_file.name)
-    frame_path = create_frame(image_path, details, temp_dir / "frame.jpg")
+    frame_path = create_frame(image_path, details, style, temp_dir / "frame.jpg")
     preview_path = temp_dir / "preview.mp4"
     final_path = temp_dir / "youtube_short_final.mp4"
 
@@ -376,6 +551,34 @@ def main() -> None:
     verse_text = st.text_area("Bible verse text", placeholder="The Lord is my shepherd; I shall not want.")
     duration = st.slider("Video duration", min_value=5, max_value=MAX_DURATION_SECONDS, value=30, step=1)
 
+    with st.expander("Text style", expanded=True):
+        font_family = st.selectbox("Font", FONT_FAMILIES, index=0)
+        text_color = st.color_picker("Text color", "#5C2F05")
+        glow_color = st.color_picker("Soft contrast color", "#FFF4D8")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            date_size = st.slider("Date size", min_value=40, max_value=130, value=82, step=2)
+        with col2:
+            verse_size = st.slider("Verse size", min_value=44, max_value=120, value=82, step=2)
+        with col3:
+            reference_size = st.slider("Reference size", min_value=34, max_value=100, value=58, step=2)
+        col4, col5 = st.columns(2)
+        with col4:
+            glow_strength = st.slider("Text clarity glow", min_value=0, max_value=6, value=2, step=1)
+        with col5:
+            shadow_strength = st.slider("Shadow strength", min_value=0, max_value=220, value=80, step=10)
+
+    style = TextStyle(
+        font_family=font_family,
+        text_color=text_color,
+        glow_color=glow_color,
+        date_size=date_size,
+        verse_size=verse_size,
+        reference_size=reference_size,
+        glow_strength=glow_strength,
+        shadow_strength=shadow_strength,
+    )
+
     ready = all([background_file, music_file, date_text.strip(), verse_reference.strip(), verse_text.strip()])
     if ready:
         details = VideoDetails(
@@ -384,7 +587,7 @@ def main() -> None:
             verse_text=verse_text.strip(),
             duration=duration,
         )
-        render_section(details, background_file, music_file)
+        render_section(details, style, background_file, music_file)
     else:
         st.info("Complete all fields above. The Create Preview button will appear after the image, music, date, Bible reference, and verse text are provided.")
         st.button("Create Preview", disabled=True)
