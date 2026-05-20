@@ -8,13 +8,16 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 try:
-    from moviepy import AudioFileClip, ImageClip
+    from moviepy import AudioFileClip, CompositeVideoClip, ImageClip, VideoClip
+    from moviepy.audio.fx import AudioFadeOut
 except ImportError:  # moviepy < 2
-    from moviepy.editor import AudioFileClip, ImageClip
+    from moviepy.editor import AudioFileClip, CompositeVideoClip, ImageClip, VideoClip
+    from moviepy.audio.fx import audio_fadeout
 
 
 WIDTH = 1080
@@ -22,6 +25,11 @@ HEIGHT = 1920
 MAX_DURATION_SECONDS = 60
 PREVIEW_DURATION_SECONDS = 8
 FPS = 30
+BACKGROUND_ZOOM = 0.08
+AUDIO_FADE_OUT_SECONDS = 4
+TEXT_FADE_SECONDS = 1.4
+TEXT_BLUR_TRANSITION_SECONDS = 1.8
+TEXT_BLUR_RADIUS = 5
 WORK_DIR = Path("generated")
 FONT_CACHE_DIR = WORK_DIR / "fonts"
 TEXT_COLOR = (92, 47, 5)
@@ -323,8 +331,14 @@ def draw_centered_text_with_contrast(
     return y
 
 
-def create_frame(image_path: Path, details: VideoDetails, style: TextStyle, output_path: Path) -> Path:
+def create_background_frame(image_path: Path, output_path: Path) -> Path:
     frame = fit_image_to_short(image_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    frame.save(output_path, quality=95)
+    return output_path
+
+
+def create_text_overlay(details: VideoDetails, style: TextStyle, output_path: Path) -> Path:
     scale = TEXT_RENDER_SCALE
     canvas_size = (WIDTH * scale, HEIGHT * scale)
     text_layer = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
@@ -405,20 +419,100 @@ def create_frame(image_path: Path, details: VideoDetails, style: TextStyle, outp
     overlay = Image.alpha_composite(shadow_layer, glow_layer)
     overlay = Image.alpha_composite(overlay, text_layer)
     overlay = overlay.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    overlay.save(output_path)
+    return output_path
+
+
+def create_blurred_text_overlay(text_overlay_path: Path, output_path: Path) -> Path:
+    overlay = Image.open(text_overlay_path).convert("RGBA")
+    blurred = overlay.filter(ImageFilter.GaussianBlur(radius=TEXT_BLUR_RADIUS))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    blurred.save(output_path)
+    return output_path
+
+
+def create_frame(image_path: Path, details: VideoDetails, style: TextStyle, output_path: Path) -> Path:
+    frame = fit_image_to_short(image_path)
+    overlay = Image.open(create_text_overlay(details, style, output_path.parent / "text_overlay.png")).convert("RGBA")
     composed = Image.alpha_composite(frame.convert("RGBA"), overlay).convert("RGB")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     composed.save(output_path, quality=95)
     return output_path
 
 
-def render_video(frame_path: Path, audio_path: Path, output_path: Path, duration: int, bitrate: str) -> Path:
+def clip_with_duration(clip, duration: float):
+    return clip.with_duration(duration) if hasattr(clip, "with_duration") else clip.set_duration(duration)
+
+
+def clip_with_audio(video, audio):
+    return video.with_audio(audio) if hasattr(video, "with_audio") else video.set_audio(audio)
+
+
+def clip_with_mask(clip, mask):
+    return clip.with_mask(mask) if hasattr(clip, "with_mask") else clip.set_mask(mask)
+
+
+def apply_audio_fade_out(audio, duration: float):
+    fade_duration = min(AUDIO_FADE_OUT_SECONDS, max(1, duration / 3))
+    if hasattr(audio, "with_effects"):
+        return audio.with_effects([AudioFadeOut(fade_duration)])
+    return audio_fadeout(audio, fade_duration)
+
+
+def smoothstep(value: float) -> float:
+    value = max(0.0, min(1.0, value))
+    return value * value * (3 - 2 * value)
+
+
+def text_opacity_at(time_value: float, duration: float) -> float:
+    fade_in = smoothstep(time_value / min(TEXT_FADE_SECONDS, duration / 3))
+    fade_out = smoothstep((duration - time_value) / min(TEXT_FADE_SECONDS, duration / 3))
+    return min(fade_in, fade_out)
+
+
+def blur_opacity_at(time_value: float, duration: float) -> float:
+    visible_text = text_opacity_at(time_value, duration)
+    intro_blur = 1 - smoothstep(time_value / min(TEXT_BLUR_TRANSITION_SECONDS, duration / 2))
+    outro_blur = 1 - smoothstep((duration - time_value) / min(TEXT_BLUR_TRANSITION_SECONDS, duration / 2))
+    return visible_text * max(intro_blur, outro_blur) * 0.85
+
+
+def animated_alpha_mask(image_path: Path, duration: float, opacity_function) -> VideoClip:
+    alpha = np.asarray(Image.open(image_path).convert("RGBA").getchannel("A"), dtype=float) / 255.0
+
+    def make_frame(time_value: float):
+        return alpha * opacity_function(time_value)
+
+    mask = VideoClip(make_frame, is_mask=True, duration=duration)
+    return mask
+
+
+def render_video(background_path: Path, text_overlay_path: Path, audio_path: Path, output_path: Path, duration: int, bitrate: str) -> Path:
     audio_clip = AudioFileClip(str(audio_path))
     render_duration = min(duration, MAX_DURATION_SECONDS, audio_clip.duration or MAX_DURATION_SECONDS)
 
     audio = audio_clip.subclipped(0, render_duration) if hasattr(audio_clip, "subclipped") else audio_clip.subclip(0, render_duration)
-    video = ImageClip(str(frame_path))
-    video = video.with_duration(render_duration) if hasattr(video, "with_duration") else video.set_duration(render_duration)
-    video = video.with_audio(audio) if hasattr(video, "with_audio") else video.set_audio(audio)
+    audio = apply_audio_fade_out(audio, render_duration)
+
+    background = clip_with_duration(ImageClip(str(background_path)), render_duration)
+    if hasattr(background, "resized"):
+        background = background.resized(lambda t: 1 + BACKGROUND_ZOOM * (t / render_duration))
+    else:
+        background = background.resize(lambda t: 1 + BACKGROUND_ZOOM * (t / render_duration))
+    background = background.with_position(("center", "center")) if hasattr(background, "with_position") else background.set_position(("center", "center"))
+
+    blurred_text_path = create_blurred_text_overlay(text_overlay_path, text_overlay_path.parent / "text_overlay_blur.png")
+    sharp_text = clip_with_duration(ImageClip(str(text_overlay_path)), render_duration)
+    blurred_text = clip_with_duration(ImageClip(str(blurred_text_path)), render_duration)
+    sharp_mask = animated_alpha_mask(text_overlay_path, render_duration, lambda t: text_opacity_at(t, render_duration))
+    blurred_mask = animated_alpha_mask(blurred_text_path, render_duration, lambda t: blur_opacity_at(t, render_duration))
+    sharp_text = clip_with_mask(sharp_text, sharp_mask)
+    blurred_text = clip_with_mask(blurred_text, blurred_mask)
+    sharp_text = sharp_text.with_position(("center", "center")) if hasattr(sharp_text, "with_position") else sharp_text.set_position(("center", "center"))
+    blurred_text = blurred_text.with_position(("center", "center")) if hasattr(blurred_text, "with_position") else blurred_text.set_position(("center", "center"))
+    video = CompositeVideoClip([background, blurred_text, sharp_text], size=(WIDTH, HEIGHT))
+    video = clip_with_audio(video, audio)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     video.write_videofile(
@@ -433,6 +527,11 @@ def render_video(frame_path: Path, audio_path: Path, output_path: Path, duration
 
     audio.close()
     audio_clip.close()
+    background.close()
+    blurred_text.close()
+    sharp_text.close()
+    blurred_mask.close()
+    sharp_mask.close()
     video.close()
     return output_path
 
@@ -490,13 +589,14 @@ def render_section(details: VideoDetails, style: TextStyle, background_file, mus
     temp_dir = WORK_DIR / token
     image_path = save_upload(background_file, temp_dir / background_file.name)
     audio_path = save_upload(music_file, temp_dir / music_file.name)
-    frame_path = create_frame(image_path, details, style, temp_dir / "frame.jpg")
+    background_path = create_background_frame(image_path, temp_dir / "background.jpg")
+    text_overlay_path = create_text_overlay(details, style, temp_dir / "text_overlay.png")
     preview_path = temp_dir / "preview.mp4"
     final_path = temp_dir / "youtube_short_final.mp4"
 
     if st.button("Create Preview", type="primary"):
         with st.spinner("Rendering preview..."):
-            render_video(frame_path, audio_path, preview_path, min(details.duration, PREVIEW_DURATION_SECONDS), "2500k")
+            render_video(background_path, text_overlay_path, audio_path, preview_path, min(details.duration, PREVIEW_DURATION_SECONDS), "2500k")
         st.session_state["preview_path"] = str(preview_path)
         st.session_state["final_ready_token"] = token
 
@@ -512,7 +612,7 @@ def render_section(details: VideoDetails, style: TextStyle, background_file, mus
         approved = st.checkbox("I approve this preview and want to generate the final MP4")
         if approved and st.button("Generate Final MP4"):
             with st.spinner("Rendering final YouTube Short..."):
-                render_video(frame_path, audio_path, final_path, details.duration, "8000k")
+                render_video(background_path, text_overlay_path, audio_path, final_path, details.duration, "8000k")
             duration = probe_duration(final_path)
             file_size_mb = final_path.stat().st_size / (1024 * 1024)
 
