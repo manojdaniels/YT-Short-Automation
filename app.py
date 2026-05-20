@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 import shutil
 import subprocess
 import urllib.request
@@ -22,6 +23,12 @@ except ImportError:  # moviepy < 2
 
 WIDTH = 1080
 HEIGHT = 1920
+MORPH_4K_WIDTH = 3840
+MORPH_4K_HEIGHT = 2160
+MORPH_PREVIEW_MAX_WIDTH = 1280
+MORPH_PREVIEW_MAX_HEIGHT = 720
+MORPH_MAX_IMAGES = 10
+MORPH_MIN_IMAGES = 1
 MAX_DURATION_SECONDS = 60
 PREVIEW_DURATION_SECONDS = 8
 FPS = 30
@@ -58,6 +65,29 @@ DOWNLOADABLE_FONTS = {
     "Cinzel": "https://raw.githubusercontent.com/google/fonts/main/ofl/cinzel/Cinzel%5Bwght%5D.ttf",
     "Cormorant Garamond": "https://raw.githubusercontent.com/google/fonts/main/ofl/cormorantgaramond/CormorantGaramond%5Bwght%5D.ttf",
     "Montserrat": "https://raw.githubusercontent.com/google/fonts/main/ofl/montserrat/Montserrat%5Bwght%5D.ttf",
+}
+
+VIDEO_DIMENSIONS = {
+    "YouTube": {
+        "Horizontal": (3840, 2160, "4K landscape video"),
+        "Vertical": (2160, 3840, "4K YouTube Shorts style video"),
+    },
+    "TikTok": {
+        "Vertical": (1080, 1920, "TikTok/Reels portrait video"),
+        "Horizontal": (1920, 1080, "Landscape upload video"),
+    },
+    "Facebook": {
+        "Vertical": (1080, 1920, "Facebook/Reels portrait video"),
+        "Horizontal": (1920, 1080, "Facebook landscape feed video"),
+    },
+    "Instagram": {
+        "Vertical": (1080, 1920, "Instagram Reels/Stories portrait video"),
+        "Horizontal": (1920, 1080, "Instagram landscape feed video"),
+    },
+    "Twitter / X": {
+        "Horizontal": (1920, 1080, "X landscape video"),
+        "Vertical": (1080, 1920, "X portrait video"),
+    },
 }
 
 
@@ -114,6 +144,24 @@ def fit_image_to_short(image_path: Path) -> Image.Image:
     left = (new_width - WIDTH) // 2
     top = (new_height - HEIGHT) // 2
     return image.crop((left, top, left + WIDTH, top + HEIGHT))
+
+
+def fit_image_to_canvas(image_path: Path, width: int, height: int) -> Image.Image:
+    image = Image.open(image_path).convert("RGB")
+    source_ratio = image.width / image.height
+    target_ratio = width / height
+
+    if source_ratio > target_ratio:
+        new_height = height
+        new_width = math.ceil(height * source_ratio)
+    else:
+        new_width = width
+        new_height = math.ceil(width / source_ratio)
+
+    image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+    left = (new_width - width) // 2
+    top = (new_height - height) // 2
+    return image.crop((left, top, left + width, top + height))
 
 
 def load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
@@ -554,15 +602,7 @@ def render_video(background_path: Path, text_overlay_path: Path, audio_path: Pat
     video = clip_with_audio(video, audio)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    video.write_videofile(
-        str(output_path),
-        fps=FPS,
-        codec="libx264",
-        audio_codec="aac",
-        bitrate=bitrate,
-        preset="medium",
-        logger=None,
-    )
+    write_mp4_with_gpu_fallback(video, output_path, FPS, bitrate, use_gpu=True, audio_codec="aac")
 
     audio.close()
     audio_clip.close()
@@ -573,6 +613,295 @@ def render_video(background_path: Path, text_overlay_path: Path, audio_path: Pat
     sharp_mask.close()
     video.close()
     return output_path
+
+
+def uploaded_files_digest(uploaded_files, *parts: str) -> str:
+    digest = hashlib.sha256()
+    for uploaded_file in uploaded_files:
+        digest.update(uploaded_file.name.encode("utf-8"))
+        digest.update(str(uploaded_file.size).encode("utf-8"))
+        digest.update(uploaded_file.getbuffer())
+    for part in parts:
+        digest.update(part.encode("utf-8"))
+    return digest.hexdigest()[:12]
+
+
+def save_ordered_images(uploaded_files, destination: Path) -> list[Path]:
+    destination.mkdir(parents=True, exist_ok=True)
+    paths: list[Path] = []
+    for index, uploaded_file in enumerate(uploaded_files, start=1):
+        suffix = Path(uploaded_file.name).suffix.lower() or ".png"
+        image_path = save_upload(uploaded_file, destination / f"{index:02d}_{Path(uploaded_file.name).stem}{suffix}")
+        paths.append(image_path)
+    return paths
+
+
+def preview_dimensions(width: int, height: int) -> tuple[int, int]:
+    scale = min(MORPH_PREVIEW_MAX_WIDTH / width, MORPH_PREVIEW_MAX_HEIGHT / height, 1.0)
+    preview_width = max(2, int(width * scale) // 2 * 2)
+    preview_height = max(2, int(height * scale) // 2 * 2)
+    return preview_width, preview_height
+
+
+def ffmpeg_supports_encoder(encoder_name: str) -> bool:
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return False
+    result = subprocess.run(
+        [ffmpeg, "-hide_banner", "-encoders"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return encoder_name in result.stdout
+
+
+def preferred_video_codec(use_gpu: bool) -> tuple[str, list[str]]:
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        os.environ["IMAGEIO_FFMPEG_EXE"] = ffmpeg
+    if use_gpu and ffmpeg_supports_encoder("h264_nvenc"):
+        return "h264_nvenc", ["-preset", "p4", "-rc", "vbr", "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+    return "libx264", ["-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+
+
+def write_mp4_with_gpu_fallback(video, output_path: Path, fps: int, bitrate: str, use_gpu: bool, audio_codec: str | None = None) -> str:
+    codec, ffmpeg_params = preferred_video_codec(use_gpu)
+    kwargs = {
+        "fps": fps,
+        "codec": codec,
+        "bitrate": bitrate,
+        "preset": "medium",
+        "ffmpeg_params": ffmpeg_params,
+        "logger": None,
+    }
+    if audio_codec:
+        kwargs["audio_codec"] = audio_codec
+    else:
+        kwargs["audio"] = False
+
+    try:
+        video.write_videofile(str(output_path), **kwargs)
+        return codec
+    except Exception:
+        if codec != "h264_nvenc":
+            raise
+        if output_path.exists():
+            output_path.unlink()
+        fallback_kwargs = dict(kwargs)
+        fallback_kwargs["codec"] = "libx264"
+        fallback_kwargs["ffmpeg_params"] = ["-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+        video.write_videofile(str(output_path), **fallback_kwargs)
+        return "libx264"
+
+
+def scaled_image(image: Image.Image, scale: float) -> Image.Image:
+    width, height = image.size
+    scaled_width = max(width, int(width * scale))
+    scaled_height = max(height, int(height * scale))
+    enlarged = image.resize((scaled_width, scaled_height), Image.Resampling.LANCZOS)
+    left = (scaled_width - width) // 2
+    top = (scaled_height - height) // 2
+    return enlarged.crop((left, top, left + width, top + height))
+
+
+def glowing_fade_frame(first: Image.Image, second: Image.Image, alpha: float, glow_strength: float) -> Image.Image:
+    eased = smoothstep(alpha)
+    wave = math.sin(math.pi * eased)
+    zoom_first = scaled_image(first, 1 + 0.035 * eased)
+    zoom_second = scaled_image(second, 1 + 0.035 * (1 - eased))
+    blended = Image.blend(zoom_first, zoom_second, eased)
+
+    blur_radius = max(0.1, glow_strength * 8 * wave)
+    glow = blended.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    frame = Image.blend(blended, glow, min(0.45, 0.14 + 0.31 * wave))
+
+    if wave > 0:
+        tint = Image.new("RGB", frame.size, (80, 170, 255))
+        frame = Image.blend(frame, tint, min(0.18, 0.18 * glow_strength * wave))
+    return frame
+
+
+def render_morph_video(
+    image_paths: list[Path],
+    output_path: Path,
+    width: int,
+    height: int,
+    fps: int,
+    hold_seconds: float,
+    transition_seconds: float,
+    glow_strength: float,
+    bitrate: str,
+    use_gpu: bool,
+) -> Path:
+    images = [fit_image_to_canvas(path, width, height) for path in image_paths]
+    if not images:
+        raise ValueError("At least one image is required.")
+
+    duration = (len(images) * hold_seconds) + (max(0, len(images) - 1) * transition_seconds)
+    duration = max(1.0, duration)
+
+    def make_frame(time_value: float):
+        cursor = 0.0
+        for index, image in enumerate(images):
+            if time_value < cursor + hold_seconds or index == len(images) - 1:
+                return np.asarray(image)
+            cursor += hold_seconds
+
+            if time_value < cursor + transition_seconds:
+                alpha = (time_value - cursor) / max(0.001, transition_seconds)
+                frame = glowing_fade_frame(image, images[index + 1], alpha, glow_strength)
+                return np.asarray(frame)
+            cursor += transition_seconds
+        return np.asarray(images[-1])
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    video = VideoClip(make_frame, duration=duration)
+    write_mp4_with_gpu_fallback(video, output_path, fps, bitrate, use_gpu)
+    video.close()
+    return output_path
+
+
+def render_morph_section(image_files) -> None:
+    WORK_DIR.mkdir(exist_ok=True)
+    st.subheader("Image Morph Video")
+    st.caption("Upload images in order. The video holds on each image, then fades through a soft blue glow into the next one.")
+
+    platform = st.selectbox("Platform", list(VIDEO_DIMENSIONS.keys()))
+    orientations = list(VIDEO_DIMENSIONS[platform].keys())
+    orientation = st.radio("Video orientation", orientations, horizontal=True)
+    width, height, preset_description = VIDEO_DIMENSIONS[platform][orientation]
+    preview_width, preview_height = preview_dimensions(width, height)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        hold_seconds = st.slider("Hold per image", min_value=0.0, max_value=5.0, value=0.8, step=0.1)
+        fps = st.selectbox("Frame rate", [24, 30, 60], index=1)
+    with col2:
+        transition_seconds = st.slider("Transition duration", min_value=0.5, max_value=6.0, value=2.0, step=0.1)
+        glow_strength = st.slider("Blue glow strength", min_value=0.0, max_value=1.6, value=0.9, step=0.1)
+
+    use_gpu = st.toggle("Use NVIDIA GPU encoding when available", value=True)
+    gpu_ready = ffmpeg_supports_encoder("h264_nvenc")
+    if use_gpu and gpu_ready:
+        st.success("NVIDIA NVENC encoding is available and will be used for MP4 rendering.")
+    elif use_gpu:
+        st.warning("NVIDIA NVENC was not found in FFmpeg. Rendering will use CPU encoding.")
+    else:
+        st.info("GPU encoding is off. Rendering will use CPU encoding.")
+
+    image_count = len(image_files) if image_files else 0
+    if image_files:
+        st.write("Render order:")
+        for index, image_file in enumerate(image_files, start=1):
+            st.write(f"{index}. {image_file.name}")
+
+    if image_count < MORPH_MIN_IMAGES:
+        st.info("Upload at least one image to create a video.")
+        st.button("Create Preview", disabled=True)
+        return
+    if image_count > MORPH_MAX_IMAGES:
+        st.error(f"Please upload no more than {MORPH_MAX_IMAGES} images.")
+        st.button("Create Preview", disabled=True)
+        return
+
+    duration = (image_count * hold_seconds) + (max(0, image_count - 1) * transition_seconds)
+    st.write(
+        {
+            "platform": platform,
+            "orientation": orientation,
+            "images": image_count,
+            "final_resolution": f"{width}x{height}",
+            "preview_resolution": f"{preview_width}x{preview_height}",
+            "preset": preset_description,
+            "fps": fps,
+            "duration_seconds": round(duration, 2),
+            "format": "MP4",
+            "encoder": "h264_nvenc" if use_gpu and gpu_ready else "libx264",
+        }
+    )
+
+    token = uploaded_files_digest(
+        image_files,
+        platform,
+        orientation,
+        str(width),
+        str(height),
+        str(fps),
+        str(hold_seconds),
+        str(transition_seconds),
+        str(glow_strength),
+        str(use_gpu),
+    )
+    temp_dir = WORK_DIR / f"morph_{token}"
+    preview_path = temp_dir / "image_transition_preview.mp4"
+    final_path = temp_dir / f"{platform.lower().replace(' / ', '_').replace(' ', '_')}_{orientation.lower()}_final.mp4"
+
+    if st.button("Create Preview", type="primary"):
+        with st.spinner("Rendering preview..."):
+            image_paths = save_ordered_images(image_files, temp_dir / "source_images")
+            render_morph_video(
+                image_paths,
+                preview_path,
+                preview_width,
+                preview_height,
+                fps,
+                hold_seconds,
+                transition_seconds,
+                glow_strength,
+                "6000k",
+                use_gpu,
+            )
+        st.session_state["morph_preview_path"] = str(preview_path)
+        st.session_state["morph_preview_token"] = token
+        st.session_state.pop("morph_final_path", None)
+
+    preview_value = st.session_state.get("morph_preview_path")
+    current_preview = st.session_state.get("morph_preview_token") == token
+    rendered_preview = Path(preview_value) if preview_value and current_preview else None
+    if rendered_preview and rendered_preview.exists():
+        st.subheader("Preview")
+        st.video(str(rendered_preview))
+        approved = st.checkbox("I approve this preview and want to render the final MP4")
+        if approved and st.button("Generate Final MP4"):
+            with st.spinner("Rendering final MP4... higher resolutions can take a while."):
+                image_paths = save_ordered_images(image_files, temp_dir / "source_images")
+                render_morph_video(
+                    image_paths,
+                    final_path,
+                    width,
+                    height,
+                    fps,
+                    hold_seconds,
+                    transition_seconds,
+                    glow_strength,
+                    "45000k" if width >= MORPH_4K_WIDTH or height >= MORPH_4K_HEIGHT else "16000k",
+                    use_gpu,
+                )
+            st.session_state["morph_final_path"] = str(final_path)
+
+    final_value = st.session_state.get("morph_final_path")
+    rendered_final = Path(final_value) if final_value else None
+    if rendered_final and rendered_final.exists():
+        duration = probe_duration(rendered_final)
+        file_size_mb = rendered_final.stat().st_size / (1024 * 1024)
+        st.success("Final MP4 generated.")
+        st.video(str(rendered_final))
+        st.write(
+            {
+                "file": rendered_final.name,
+                "resolution": f"{width}x{height}",
+                "duration_seconds": round(duration or 0, 2),
+                "file_size_mb": round(file_size_mb, 2),
+            }
+        )
+        with rendered_final.open("rb") as file:
+            st.download_button(
+                "Download Final MP4",
+                data=file,
+                file_name=rendered_final.name,
+                mime="video/mp4",
+            )
 
 
 def probe_duration(video_path: Path) -> float | None:
@@ -680,69 +1009,81 @@ def render_section(details: VideoDetails, style: TextStyle, background_file, mus
 
 
 def main() -> None:
-    st.set_page_config(page_title="YouTube Short Bible Video Builder", layout="centered")
-    st.title("YouTube Short Bible Video Builder")
+    st.set_page_config(page_title="Python Video Builder", layout="centered")
+    st.title("Python Video Builder")
 
-    st.caption("Creates vertical MP4 videos at 1080x1920, 9:16, up to 60 seconds.")
+    morph_tab, bible_tab = st.tabs(["4K Image Morph", "Bible Short"])
 
-    background_file = st.file_uploader("Upload background image", type=["jpg", "jpeg", "png", "webp"])
-    music_file = st.file_uploader("Upload background music", type=["mp3", "wav", "m4a", "aac", "ogg"])
-
-    date_text = st.text_input("Current date", placeholder="20 May 2026")
-    verse_reference = st.text_input("Bible chapter and verse", placeholder="Psalm 23: 1")
-    verse_text = st.text_area("Bible verse text", placeholder="The Lord is my shepherd; I shall not want.")
-    duration = st.slider("Video duration", min_value=5, max_value=MAX_DURATION_SECONDS, value=30, step=1)
-
-    with st.expander("Text style", expanded=True):
-        font_family = st.selectbox("Font", FONT_FAMILIES, index=0)
-        text_color = st.color_picker("Text color", "#5C2F05")
-        glow_color = st.color_picker("Soft contrast color", "#FFF4D8")
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            date_size = st.slider("Date size", min_value=40, max_value=130, value=82, step=2)
-        with col2:
-            verse_size = st.slider("Verse size", min_value=44, max_value=120, value=82, step=2)
-        with col3:
-            reference_size = st.slider("Reference size", min_value=34, max_value=100, value=58, step=2)
-        col4, col5 = st.columns(2)
-        with col4:
-            glow_strength = st.slider("Text clarity glow", min_value=0, max_value=6, value=2, step=1)
-        with col5:
-            shadow_strength = st.slider("Shadow strength", min_value=0, max_value=220, value=80, step=10)
-        box_col1, box_col2, box_col3 = st.columns(3)
-        with box_col1:
-            show_date_box = st.toggle("Date box", value=True)
-        with box_col2:
-            show_verse_box = st.toggle("Verse box", value=True)
-        with box_col3:
-            show_reference_box = st.toggle("Reference box", value=True)
-
-    style = TextStyle(
-        font_family=font_family,
-        text_color=text_color,
-        glow_color=glow_color,
-        date_size=date_size,
-        verse_size=verse_size,
-        reference_size=reference_size,
-        glow_strength=glow_strength,
-        shadow_strength=shadow_strength,
-        show_date_box=show_date_box,
-        show_verse_box=show_verse_box,
-        show_reference_box=show_reference_box,
-    )
-
-    ready = all([background_file, music_file, date_text.strip(), verse_reference.strip(), verse_text.strip()])
-    if ready:
-        details = VideoDetails(
-            date_text=date_text.strip(),
-            verse_reference=verse_reference.strip(),
-            verse_text=verse_text.strip(),
-            duration=duration,
+    with morph_tab:
+        image_files = st.file_uploader(
+            "Upload 1-10 images in sequence",
+            type=["jpg", "jpeg", "png", "webp"],
+            accept_multiple_files=True,
+            key="morph_image_uploads",
         )
-        render_section(details, style, background_file, music_file)
-    else:
-        st.info("Complete all fields above. The Create Preview button will appear after the image, music, date, Bible reference, and verse text are provided.")
-        st.button("Create Preview", disabled=True)
+        render_morph_section(image_files)
+
+    with bible_tab:
+        st.caption("Creates vertical MP4 videos at 1080x1920, 9:16, up to 60 seconds.")
+
+        background_file = st.file_uploader("Upload background image", type=["jpg", "jpeg", "png", "webp"])
+        music_file = st.file_uploader("Upload background music", type=["mp3", "wav", "m4a", "aac", "ogg"])
+
+        date_text = st.text_input("Current date", placeholder="20 May 2026")
+        verse_reference = st.text_input("Bible chapter and verse", placeholder="Psalm 23: 1")
+        verse_text = st.text_area("Bible verse text", placeholder="The Lord is my shepherd; I shall not want.")
+        duration = st.slider("Video duration", min_value=5, max_value=MAX_DURATION_SECONDS, value=30, step=1)
+
+        with st.expander("Text style", expanded=True):
+            font_family = st.selectbox("Font", FONT_FAMILIES, index=0)
+            text_color = st.color_picker("Text color", "#5C2F05")
+            glow_color = st.color_picker("Soft contrast color", "#FFF4D8")
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                date_size = st.slider("Date size", min_value=40, max_value=130, value=82, step=2)
+            with col2:
+                verse_size = st.slider("Verse size", min_value=44, max_value=120, value=82, step=2)
+            with col3:
+                reference_size = st.slider("Reference size", min_value=34, max_value=100, value=58, step=2)
+            col4, col5 = st.columns(2)
+            with col4:
+                glow_strength = st.slider("Text clarity glow", min_value=0, max_value=6, value=2, step=1)
+            with col5:
+                shadow_strength = st.slider("Shadow strength", min_value=0, max_value=220, value=80, step=10)
+            box_col1, box_col2, box_col3 = st.columns(3)
+            with box_col1:
+                show_date_box = st.toggle("Date box", value=True)
+            with box_col2:
+                show_verse_box = st.toggle("Verse box", value=True)
+            with box_col3:
+                show_reference_box = st.toggle("Reference box", value=True)
+
+        style = TextStyle(
+            font_family=font_family,
+            text_color=text_color,
+            glow_color=glow_color,
+            date_size=date_size,
+            verse_size=verse_size,
+            reference_size=reference_size,
+            glow_strength=glow_strength,
+            shadow_strength=shadow_strength,
+            show_date_box=show_date_box,
+            show_verse_box=show_verse_box,
+            show_reference_box=show_reference_box,
+        )
+
+        ready = all([background_file, music_file, date_text.strip(), verse_reference.strip(), verse_text.strip()])
+        if ready:
+            details = VideoDetails(
+                date_text=date_text.strip(),
+                verse_reference=verse_reference.strip(),
+                verse_text=verse_text.strip(),
+                duration=duration,
+            )
+            render_section(details, style, background_file, music_file)
+        else:
+            st.info("Complete all fields above. The Create Preview button will appear after the image, music, date, Bible reference, and verse text are provided.")
+            st.button("Create Preview", disabled=True)
 
 
 if __name__ == "__main__":

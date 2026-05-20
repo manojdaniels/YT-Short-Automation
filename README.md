@@ -1,8 +1,21 @@
-# YouTube Short Bible Video Builder
+# Python Video Builder
 
-Python Streamlit application for creating Bible verse YouTube Shorts.
+Python Streamlit application for creating MP4 videos.
 
 ## Features
+
+### 4K Image Morph
+
+- Upload 1-10 images in sequence.
+- Select platform and orientation presets for YouTube, TikTok, Facebook, Instagram, or Twitter / X.
+- Render the final MP4 in the selected platform dimensions only.
+- Create a lower-resolution preview first, approve it, then render the final MP4.
+- Hold on each image and transition into the next image with a soft blue glow/fade effect.
+- Control hold duration, transition duration, frame rate, and glow strength.
+- Uses NVIDIA NVENC (`h264_nvenc`) for MP4 encoding when FFmpeg and the GPU support it, with CPU fallback.
+- Download the generated MP4 from the app.
+
+### Bible Short
 
 - Upload a background image.
 - Upload background music.
