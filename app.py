@@ -30,6 +30,9 @@ AUDIO_FADE_OUT_SECONDS = 4
 TEXT_FADE_SECONDS = 1.4
 TEXT_BLUR_TRANSITION_SECONDS = 1.8
 TEXT_BLUR_RADIUS = 5
+BOX_FILL = (245, 240, 228, 58)
+BOX_OUTLINE = (255, 255, 255, 115)
+BOX_SHADOW = (22, 18, 14, 42)
 WORK_DIR = Path("generated")
 FONT_CACHE_DIR = WORK_DIR / "fonts"
 TEXT_COLOR = (92, 47, 5)
@@ -331,6 +334,29 @@ def draw_centered_text_with_contrast(
     return y
 
 
+def scaled_box(box: tuple[int, int, int, int], scale: int) -> tuple[int, int, int, int]:
+    return tuple(value * scale for value in box)
+
+
+def draw_translucent_box(
+    draw: ImageDraw.ImageDraw,
+    box: tuple[int, int, int, int],
+    radius: int,
+    scale: int,
+) -> None:
+    scaled = scaled_box(box, scale)
+    scaled_radius = radius * scale
+    shadow_offset = 7 * scale
+    shadow_box = (
+        scaled[0] + shadow_offset,
+        scaled[1] + shadow_offset,
+        scaled[2] + shadow_offset,
+        scaled[3] + shadow_offset,
+    )
+    draw.rounded_rectangle(shadow_box, radius=scaled_radius, fill=BOX_SHADOW)
+    draw.rounded_rectangle(scaled, radius=scaled_radius, fill=BOX_FILL, outline=BOX_OUTLINE, width=max(1, 2 * scale))
+
+
 def create_background_frame(image_path: Path, output_path: Path) -> Path:
     frame = fit_image_to_short(image_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -344,9 +370,15 @@ def create_text_overlay(details: VideoDetails, style: TextStyle, output_path: Pa
     text_layer = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
     glow_layer = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
     shadow_layer = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
+    box_layer = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
+    box_draw = ImageDraw.Draw(box_layer)
     draw = ImageDraw.Draw(text_layer)
     glow_draw = ImageDraw.Draw(glow_layer)
     shadow_draw = ImageDraw.Draw(shadow_layer)
+
+    draw_translucent_box(box_draw, (170, 105, 910, 230), radius=0, scale=scale)
+    draw_translucent_box(box_draw, (105, 790, 975, 1375), radius=22, scale=scale)
+    draw_translucent_box(box_draw, (190, 1660, 890, 1775), radius=0, scale=scale)
 
     date_font = load_named_font(style.date_size * scale, style.font_family, bold=True)
     ref_font = load_named_font(style.reference_size * scale, style.font_family, bold=True)
@@ -368,14 +400,14 @@ def create_text_overlay(details: VideoDetails, style: TextStyle, output_path: Pa
         line_gap_ratio=0.1,
     )
     verse_height = text_block_height(draw, verse_lines, verse_font, verse_gap)
-    verse_y = max(570 * scale, 930 * scale - (verse_height // 2))
+    verse_y = max(850 * scale, 1082 * scale - (verse_height // 2))
 
     draw_centered_text_with_contrast(
         draw,
         glow_draw,
         shadow_draw,
         wrap_text(draw, details.date_text.upper(), date_font, 940 * scale),
-        245 * scale,
+        132 * scale,
         date_font,
         18 * scale,
         max(1, style.glow_strength * scale),
@@ -404,7 +436,7 @@ def create_text_overlay(details: VideoDetails, style: TextStyle, output_path: Pa
         glow_draw,
         shadow_draw,
         wrap_text(draw, format_reference(details.verse_reference), ref_font, 900 * scale),
-        1690 * scale,
+        1688 * scale,
         ref_font,
         12 * scale,
         max(1, style.glow_strength * scale),
@@ -416,7 +448,8 @@ def create_text_overlay(details: VideoDetails, style: TextStyle, output_path: Pa
 
     glow_layer = glow_layer.filter(ImageFilter.GaussianBlur(radius=max(1, style.glow_strength * scale)))
     shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(radius=max(1, 2 * scale)))
-    overlay = Image.alpha_composite(shadow_layer, glow_layer)
+    overlay = Image.alpha_composite(box_layer, shadow_layer)
+    overlay = Image.alpha_composite(overlay, glow_layer)
     overlay = Image.alpha_composite(overlay, text_layer)
     overlay = overlay.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
     output_path.parent.mkdir(parents=True, exist_ok=True)
