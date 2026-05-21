@@ -461,12 +461,16 @@ def create_text_overlay(details: VideoDetails, style: TextStyle, output_path: Pa
     glow_draw = ImageDraw.Draw(glow_layer)
     shadow_draw = ImageDraw.Draw(shadow_layer)
 
+    date_box = (170, 105, 910, 230)
+    verse_box = (105, 615, 975, 1200)
+    reference_box = (190, 1585, 890, 1700)
+
     if style.show_date_box:
-        draw_translucent_box(box_draw, (170, 105, 910, 230), radius=0, scale=scale)
+        draw_translucent_box(box_draw, date_box, radius=0, scale=scale)
     if style.show_verse_box:
-        draw_translucent_box(box_draw, (105, 790, 975, 1375), radius=22, scale=scale)
+        draw_translucent_box(box_draw, verse_box, radius=22, scale=scale)
     if style.show_reference_box:
-        draw_translucent_box(box_draw, (190, 1660, 890, 1775), radius=0, scale=scale)
+        draw_translucent_box(box_draw, reference_box, radius=0, scale=scale)
 
     date_font = load_named_font(style.date_size * scale, style.font_family, bold=True)
     ref_font = load_named_font(style.reference_size * scale, style.font_family, bold=True)
@@ -488,7 +492,7 @@ def create_text_overlay(details: VideoDetails, style: TextStyle, output_path: Pa
         line_gap_ratio=0.1,
     )
     verse_height = text_block_height(draw, verse_lines, verse_font, verse_gap)
-    verse_y = max(850 * scale, 1082 * scale - (verse_height // 2))
+    verse_y = max((verse_box[1] + 60) * scale, ((verse_box[1] + verse_box[3]) // 2) * scale - (verse_height // 2))
 
     draw_centered_text_with_contrast(
         draw,
@@ -524,7 +528,7 @@ def create_text_overlay(details: VideoDetails, style: TextStyle, output_path: Pa
         glow_draw,
         shadow_draw,
         wrap_text(draw, format_reference(details.verse_reference), ref_font, 900 * scale),
-        1688 * scale,
+        1612 * scale,
         ref_font,
         12 * scale,
         max(1, style.glow_strength * scale),
