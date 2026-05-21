@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import math
 import os
 import shutil
 import subprocess
 import urllib.request
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,6 +31,8 @@ MORPH_PREVIEW_MAX_WIDTH = 1280
 MORPH_PREVIEW_MAX_HEIGHT = 720
 MORPH_MAX_IMAGES = 10
 MORPH_MIN_IMAGES = 1
+SPLITTER_MAX_GRID_SIZE = 12
+SPLITTER_MAX_PREVIEW_IMAGES = 36
 MAX_DURATION_SECONDS = 60
 PREVIEW_DURATION_SECONDS = 8
 FPS = 30
@@ -663,6 +667,170 @@ def save_ordered_images(uploaded_files, destination: Path) -> list[Path]:
     return paths
 
 
+def detect_grid_layout(image: Image.Image, max_grid_size: int = SPLITTER_MAX_GRID_SIZE) -> tuple[int, int, float]:
+    sample = image.convert("L")
+    scale = min(900 / sample.width, 900 / sample.height, 1.0)
+    if scale < 1.0:
+        sample = sample.resize((max(1, int(sample.width * scale)), max(1, int(sample.height * scale))), Image.Resampling.BILINEAR)
+
+    pixels = np.asarray(sample, dtype=np.float32)
+    if pixels.shape[0] < 2 or pixels.shape[1] < 2:
+        return 1, 1, 0.0
+
+    vertical_changes = np.mean(np.abs(pixels[:, 1:] - pixels[:, :-1]), axis=0)
+    horizontal_changes = np.mean(np.abs(pixels[1:, :] - pixels[:-1, :]), axis=1)
+
+    def boundary_score(changes: np.ndarray, size: int, pieces: int) -> float:
+        if pieces <= 1:
+            return 0.0
+        window_radius = max(2, min(8, size // 180))
+        boundaries = [round((size * part) / pieces) - 1 for part in range(1, pieces)]
+        baseline = float(np.mean(changes))
+        spread = float(np.std(changes)) or 1.0
+        scores = []
+        for boundary in boundaries:
+            start = min(max(boundary - window_radius, 0), len(changes) - 1)
+            end = min(max(boundary + window_radius + 1, start + 1), len(changes))
+            scores.append((float(np.max(changes[start:end])) - baseline) / spread)
+        return float(np.mean(scores))
+
+    best_rows, best_cols, best_score = 1, 1, -999.0
+    sample_width, sample_height = sample.size
+    for rows in range(1, max_grid_size + 1):
+        for cols in range(1, max_grid_size + 1):
+            if rows * cols == 1:
+                continue
+            if image.width // cols < 32 or image.height // rows < 32:
+                continue
+
+            seam_score = boundary_score(vertical_changes, sample_width, cols) + boundary_score(horizontal_changes, sample_height, rows)
+            divisibility_bonus = 0.0
+            if image.width % cols == 0:
+                divisibility_bonus += 0.25
+            if image.height % rows == 0:
+                divisibility_bonus += 0.25
+            grid_complexity_penalty = 0.025 * (rows + cols)
+            score = seam_score + divisibility_bonus - grid_complexity_penalty
+
+            if score > best_score:
+                best_rows, best_cols, best_score = rows, cols, score
+
+    confidence = max(0.0, min(1.0, (best_score + 0.5) / 4.0))
+    return best_rows, best_cols, confidence
+
+
+def split_grid_image(image: Image.Image, rows: int, cols: int, output_dir: Path, base_name: str) -> list[Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    cell_width = image.width // cols
+    cell_height = image.height // rows
+    usable_width = cell_width * cols
+    usable_height = cell_height * rows
+    left_margin = (image.width - usable_width) // 2
+    top_margin = (image.height - usable_height) // 2
+
+    saved_paths: list[Path] = []
+    for row in range(rows):
+        for col in range(cols):
+            left = left_margin + (col * cell_width)
+            top = top_margin + (row * cell_height)
+            crop = image.crop((left, top, left + cell_width, top + cell_height))
+            output_path = output_dir / f"{base_name}_{row + 1:02d}_{col + 1:02d}.png"
+            crop.save(output_path)
+            saved_paths.append(output_path)
+    return saved_paths
+
+
+def zip_files(file_paths: list[Path]) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for file_path in file_paths:
+            archive.write(file_path, arcname=file_path.name)
+    return buffer.getvalue()
+
+
+def render_image_splitter_section(uploaded_file) -> None:
+    WORK_DIR.mkdir(exist_ok=True)
+    st.subheader("Image Splitter")
+    st.caption("Upload one collage image, detect the grid, then export every tile as a separate PNG.")
+
+    if not uploaded_file:
+        st.info("Upload a collage image to detect and split it.")
+        return
+
+    token = uploaded_files_digest([uploaded_file], "image-splitter")
+    temp_dir = WORK_DIR / token / "splitter"
+    source_suffix = Path(uploaded_file.name).suffix.lower() or ".png"
+    source_path = save_upload(uploaded_file, temp_dir / f"source{source_suffix}")
+    image = Image.open(source_path).convert("RGB")
+    auto_rows, auto_cols, confidence = detect_grid_layout(image)
+
+    st.image(image, caption=f"{uploaded_file.name} - {image.width}x{image.height}px", use_container_width=True)
+    st.write(
+        {
+            "detected_rows": auto_rows,
+            "detected_columns": auto_cols,
+            "detected_images": auto_rows * auto_cols,
+            "confidence": f"{confidence:.0%}",
+        }
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        rows = st.number_input("Rows", min_value=1, max_value=SPLITTER_MAX_GRID_SIZE, value=auto_rows, step=1)
+    with col2:
+        cols = st.number_input("Columns", min_value=1, max_value=SPLITTER_MAX_GRID_SIZE, value=auto_cols, step=1)
+
+    rows = int(rows)
+    cols = int(cols)
+    cell_width = image.width // cols
+    cell_height = image.height // rows
+    if cell_width < 1 or cell_height < 1:
+        st.error("The selected rows and columns are too high for this image.")
+        return
+
+    image_count = rows * cols
+    st.write(
+        {
+            "output_images": image_count,
+            "output_size_each": f"{cell_width}x{cell_height}px",
+        }
+    )
+
+    if confidence < 0.35:
+        st.warning("The automatic detection is uncertain. Adjust rows and columns if the preview does not match your collage.")
+
+    if st.button("Split Image", type="primary", key="splitter_create_files"):
+        output_dir = temp_dir / f"{rows}x{cols}"
+        split_paths = split_grid_image(image, rows, cols, output_dir, Path(uploaded_file.name).stem or "split")
+        st.session_state["splitter_paths"] = [str(path) for path in split_paths]
+        st.session_state["splitter_token"] = token
+        st.session_state["splitter_grid"] = f"{rows}x{cols}"
+
+    current_paths = st.session_state.get("splitter_paths", [])
+    current_token = st.session_state.get("splitter_token")
+    current_grid = st.session_state.get("splitter_grid")
+    if current_paths and current_token == token and current_grid == f"{rows}x{cols}":
+        split_paths = [Path(path) for path in current_paths if Path(path).exists()]
+        if split_paths:
+            st.success(f"Created {len(split_paths)} image files.")
+            preview_paths = split_paths[:SPLITTER_MAX_PREVIEW_IMAGES]
+            preview_cols = st.columns(min(3, len(preview_paths)))
+            for index, split_path in enumerate(preview_paths):
+                with preview_cols[index % len(preview_cols)]:
+                    st.image(str(split_path), caption=split_path.name, use_container_width=True)
+            if len(split_paths) > SPLITTER_MAX_PREVIEW_IMAGES:
+                st.caption(f"Showing the first {SPLITTER_MAX_PREVIEW_IMAGES} images.")
+
+            zip_name = f"{Path(uploaded_file.name).stem or 'split'}_{rows}x{cols}_images.zip"
+            st.download_button(
+                "Download All Images",
+                data=zip_files(split_paths),
+                file_name=zip_name,
+                mime="application/zip",
+                key="splitter_download_zip",
+            )
+
+
 def preview_dimensions(width: int, height: int) -> tuple[int, int]:
     scale = min(MORPH_PREVIEW_MAX_WIDTH / width, MORPH_PREVIEW_MAX_HEIGHT / height, 1.0)
     preview_width = max(2, int(width * scale) // 2 * 2)
@@ -1124,7 +1292,15 @@ def main() -> None:
     st.set_page_config(page_title="Python Video Builder", layout="centered")
     st.title("Python Video Builder")
 
-    morph_tab, bible_tab = st.tabs(["4K Image Morph", "Bible Short"])
+    splitter_tab, morph_tab, bible_tab = st.tabs(["Image Splitter", "4K Image Morph", "Bible Short"])
+
+    with splitter_tab:
+        collage_file = st.file_uploader(
+            "Upload collage image",
+            type=["jpg", "jpeg", "png", "webp"],
+            key="splitter_image_upload",
+        )
+        render_image_splitter_section(collage_file)
 
     with morph_tab:
         image_files = st.file_uploader(
