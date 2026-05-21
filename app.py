@@ -33,6 +33,9 @@ MORPH_MAX_IMAGES = 10
 MORPH_MIN_IMAGES = 1
 SPLITTER_MAX_GRID_SIZE = 12
 SPLITTER_MAX_PREVIEW_IMAGES = 36
+SPLITTER_4K_LANDSCAPE = (3840, 2160)
+SPLITTER_4K_PORTRAIT = (2160, 3840)
+SPLITTER_4K_SQUARE = (3840, 3840)
 MAX_DURATION_SECONDS = 60
 PREVIEW_DURATION_SECONDS = 8
 FPS = 30
@@ -719,7 +722,32 @@ def detect_grid_layout(image: Image.Image, max_grid_size: int = SPLITTER_MAX_GRI
     return best_rows, best_cols, confidence
 
 
-def split_grid_image(image: Image.Image, rows: int, cols: int, output_dir: Path, base_name: str) -> list[Path]:
+def splitter_4k_size(width: int, height: int) -> tuple[int, int]:
+    if width > height:
+        return SPLITTER_4K_LANDSCAPE
+    if height > width:
+        return SPLITTER_4K_PORTRAIT
+    return SPLITTER_4K_SQUARE
+
+
+def resize_image_fill(image: Image.Image, width: int, height: int) -> Image.Image:
+    source_ratio = image.width / image.height
+    target_ratio = width / height
+
+    if source_ratio > target_ratio:
+        new_height = height
+        new_width = math.ceil(height * source_ratio)
+    else:
+        new_width = width
+        new_height = math.ceil(width / source_ratio)
+
+    resized = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+    left = (new_width - width) // 2
+    top = (new_height - height) // 2
+    return resized.crop((left, top, left + width, top + height))
+
+
+def split_grid_image(image: Image.Image, rows: int, cols: int, output_dir: Path, base_name: str, upscale_to_4k: bool = True) -> list[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     cell_width = image.width // cols
     cell_height = image.height // rows
@@ -734,7 +762,10 @@ def split_grid_image(image: Image.Image, rows: int, cols: int, output_dir: Path,
             left = left_margin + (col * cell_width)
             top = top_margin + (row * cell_height)
             crop = image.crop((left, top, left + cell_width, top + cell_height))
-            output_path = output_dir / f"{base_name}_{row + 1:02d}_{col + 1:02d}.png"
+            if upscale_to_4k:
+                crop = resize_image_fill(crop, *splitter_4k_size(cell_width, cell_height))
+            suffix = "_4k" if upscale_to_4k else ""
+            output_path = output_dir / f"{base_name}_{row + 1:02d}_{col + 1:02d}{suffix}.png"
             crop.save(output_path)
             saved_paths.append(output_path)
     return saved_paths
@@ -788,11 +819,14 @@ def render_image_splitter_section(uploaded_file) -> None:
         st.error("The selected rows and columns are too high for this image.")
         return
 
+    upscale_to_4k = st.toggle("Upscale output images to 4K", value=True)
+    output_width, output_height = splitter_4k_size(cell_width, cell_height) if upscale_to_4k else (cell_width, cell_height)
     image_count = rows * cols
     st.write(
         {
             "output_images": image_count,
-            "output_size_each": f"{cell_width}x{cell_height}px",
+            "cropped_size_each": f"{cell_width}x{cell_height}px",
+            "final_size_each": f"{output_width}x{output_height}px",
         }
     )
 
@@ -800,16 +834,16 @@ def render_image_splitter_section(uploaded_file) -> None:
         st.warning("The automatic detection is uncertain. Adjust rows and columns if the preview does not match your collage.")
 
     if st.button("Split Image", type="primary", key="splitter_create_files"):
-        output_dir = temp_dir / f"{rows}x{cols}"
-        split_paths = split_grid_image(image, rows, cols, output_dir, Path(uploaded_file.name).stem or "split")
+        output_dir = temp_dir / f"{rows}x{cols}_{'4k' if upscale_to_4k else 'original'}"
+        split_paths = split_grid_image(image, rows, cols, output_dir, Path(uploaded_file.name).stem or "split", upscale_to_4k)
         st.session_state["splitter_paths"] = [str(path) for path in split_paths]
         st.session_state["splitter_token"] = token
-        st.session_state["splitter_grid"] = f"{rows}x{cols}"
+        st.session_state["splitter_grid"] = f"{rows}x{cols}_{upscale_to_4k}"
 
     current_paths = st.session_state.get("splitter_paths", [])
     current_token = st.session_state.get("splitter_token")
     current_grid = st.session_state.get("splitter_grid")
-    if current_paths and current_token == token and current_grid == f"{rows}x{cols}":
+    if current_paths and current_token == token and current_grid == f"{rows}x{cols}_{upscale_to_4k}":
         split_paths = [Path(path) for path in current_paths if Path(path).exists()]
         if split_paths:
             st.success(f"Created {len(split_paths)} image files.")
@@ -821,7 +855,8 @@ def render_image_splitter_section(uploaded_file) -> None:
             if len(split_paths) > SPLITTER_MAX_PREVIEW_IMAGES:
                 st.caption(f"Showing the first {SPLITTER_MAX_PREVIEW_IMAGES} images.")
 
-            zip_name = f"{Path(uploaded_file.name).stem or 'split'}_{rows}x{cols}_images.zip"
+            zip_suffix = "4k_images" if upscale_to_4k else "images"
+            zip_name = f"{Path(uploaded_file.name).stem or 'split'}_{rows}x{cols}_{zip_suffix}.zip"
             st.download_button(
                 "Download All Images",
                 data=zip_files(split_paths),
