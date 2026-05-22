@@ -47,6 +47,8 @@ AUDIO_FADE_OUT_SECONDS = 4
 TEXT_FADE_SECONDS = 1.4
 TEXT_BLUR_TRANSITION_SECONDS = 1.8
 TEXT_BLUR_RADIUS = 5
+CAPTION_WORDS_PER_CARD = 7
+CAPTION_POSITIONS = ["Bottom", "Above Reference", "Below Verse", "Above Verse", "Top"]
 BOX_FILL = (245, 240, 228, 58)
 BOX_OUTLINE = (255, 255, 255, 115)
 BOX_SHADOW = (22, 18, 14, 42)
@@ -607,6 +609,75 @@ def create_logo_overlay(logo_path: Path, style: LogoStyle, output_path: Path) ->
     return output_path
 
 
+def chunk_caption_text(text: str, words_per_card: int = CAPTION_WORDS_PER_CARD) -> list[str]:
+    words = text.replace("\n", " ").split()
+    if not words:
+        return []
+    return [" ".join(words[index : index + words_per_card]) for index in range(0, len(words), words_per_card)]
+
+
+def caption_y_for_position(position: str, caption_height: int) -> int:
+    if position == "Top":
+        return 320
+    if position == "Above Verse":
+        return 500
+    if position == "Below Verse":
+        return 1245
+    if position == "Above Reference":
+        return 1430
+    return HEIGHT - caption_height - 80
+
+
+def create_caption_card(text: str, position: str, output_path: Path) -> Path:
+    card_width = 900
+    card_height = 150
+    overlay = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    font = load_named_font(44, "Montserrat", bold=True)
+    lines = wrap_text(draw, text, font, 820)
+    line_gap = 8
+    text_height = text_block_height(draw, lines, font, line_gap)
+    x = (WIDTH - card_width) // 2
+    y = caption_y_for_position(position, card_height)
+    draw.rounded_rectangle((x, y, x + card_width, y + card_height), radius=22, fill=(0, 0, 0, 135))
+    draw.rounded_rectangle((x, y, x + card_width, y + card_height), radius=22, outline=(255, 255, 255, 120), width=2)
+    draw_centered_text(
+        draw,
+        lines,
+        y + (card_height - text_height) // 2,
+        font,
+        (255, 255, 255, 255),
+        line_gap,
+        stroke_width=1,
+        stroke_fill=(0, 0, 0, 180),
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    overlay.save(output_path)
+    return output_path
+
+
+def create_caption_clips(caption_text: str | None, position: str, duration: float, output_dir: Path) -> list:
+    if not caption_text:
+        return []
+    chunks = chunk_caption_text(caption_text)
+    if not chunks:
+        return []
+    start_offset = min(1.0, duration * 0.1)
+    available = max(0.5, duration - (start_offset * 2))
+    chunk_duration = available / len(chunks)
+    clips = []
+    for index, chunk in enumerate(chunks):
+        card_path = create_caption_card(chunk, position, output_dir / f"caption_{index + 1:02d}.png")
+        clip = clip_with_duration(ImageClip(str(card_path)), chunk_duration)
+        if hasattr(clip, "with_start"):
+            clip = clip.with_start(start_offset + (index * chunk_duration))
+        else:
+            clip = clip.set_start(start_offset + (index * chunk_duration))
+        clip = clip.with_position(("center", "center")) if hasattr(clip, "with_position") else clip.set_position(("center", "center"))
+        clips.append(clip)
+    return clips
+
+
 def create_frame(image_path: Path, details: VideoDetails, style: TextStyle, output_path: Path) -> Path:
     frame = fit_image_to_short(image_path)
     overlay = Image.open(create_text_overlay(details, style, output_path.parent / "text_overlay.png")).convert("RGBA")
@@ -720,6 +791,9 @@ def render_video(
     text_overlay_path: Path,
     logo_overlay_path: Path | None,
     audio_path: Path,
+    narration_path: Path | None,
+    caption_text: str | None,
+    caption_position: str,
     output_path: Path,
     duration: int,
     bitrate: str,
@@ -734,6 +808,11 @@ def render_video(
     audio_layers = [music_audio]
     if include_background_video_audio and getattr(background, "audio", None):
         audio_layers.append(background.audio)
+    narration_clip = None
+    if narration_path:
+        narration_clip = AudioFileClip(str(narration_path))
+        narration_audio = narration_clip.subclipped(0, render_duration) if hasattr(narration_clip, "subclipped") else narration_clip.subclip(0, render_duration)
+        audio_layers.append(narration_audio)
     audio = CompositeAudioClip(audio_layers) if len(audio_layers) > 1 else music_audio
     audio = apply_audio_fade_out(audio, render_duration)
 
@@ -752,6 +831,8 @@ def render_video(
         logo_clip = clip_with_duration(ImageClip(str(logo_overlay_path)), render_duration)
         logo_clip = logo_clip.with_position(("center", "center")) if hasattr(logo_clip, "with_position") else logo_clip.set_position(("center", "center"))
         layers.append(logo_clip)
+    caption_clips = create_caption_clips(caption_text, caption_position, render_duration, output_path.parent / f"{output_path.stem}_captions")
+    layers.extend(caption_clips)
     video = CompositeVideoClip(layers, size=(WIDTH, HEIGHT))
     video = clip_with_audio(video, audio)
 
@@ -763,8 +844,12 @@ def render_video(
     background.close()
     if background_source:
         background_source.close()
+    if narration_clip:
+        narration_clip.close()
     if logo_clip:
         logo_clip.close()
+    for caption_clip in caption_clips:
+        caption_clip.close()
     blurred_text.close()
     sharp_text.close()
     blurred_mask.close()
@@ -1478,6 +1563,8 @@ def render_section(
     style: TextStyle,
     background_file,
     music_file,
+    narration_file,
+    caption_position: str,
     logo_file,
     logo_style: LogoStyle | None,
     include_background_video_audio: bool,
@@ -1494,6 +1581,9 @@ def render_section(
         str(background_file.size),
         music_file.name,
         str(music_file.size),
+        narration_file.name if narration_file else "no-vo",
+        str(narration_file.size) if narration_file else "0",
+        caption_position,
         logo_file.name if logo_file else "no-logo",
         str(logo_file.size) if logo_file else "0",
         logo_style_digest(logo_style),
@@ -1503,6 +1593,7 @@ def render_section(
     temp_dir = WORK_DIR / token
     background_upload_path = save_upload(background_file, temp_dir / background_file.name)
     audio_path = save_upload(music_file, temp_dir / music_file.name)
+    narration_path = save_upload(narration_file, temp_dir / narration_file.name) if narration_file else None
     if is_background_video(background_upload_path):
         background_path = background_upload_path
     else:
@@ -1522,6 +1613,9 @@ def render_section(
                 text_overlay_path,
                 logo_overlay_path,
                 audio_path,
+                narration_path,
+                details.verse_text if narration_path else None,
+                caption_position,
                 preview_path,
                 min(details.duration, PREVIEW_DURATION_SECONDS),
                 "2500k",
@@ -1548,6 +1642,9 @@ def render_section(
                     text_overlay_path,
                     logo_overlay_path,
                     audio_path,
+                    narration_path,
+                    details.verse_text if narration_path else None,
+                    caption_position,
                     final_path,
                     details.duration,
                     "8000k",
@@ -1588,6 +1685,8 @@ def render_batch_section(
     style: TextStyle,
     background_files,
     music_files,
+    narration_files,
+    caption_position: str,
     logo_file,
     logo_style: LogoStyle | None,
     duration: int,
@@ -1606,6 +1705,8 @@ def render_batch_section(
         str(use_gpu),
         *[f"bg:{file.name}:{file.size}" for file in background_files],
         *[f"music:{file.name}:{file.size}" for file in music_files],
+        *[f"vo:{file.name}:{file.size}" for file in narration_files],
+        caption_position,
         *[f"{row.date_text}|{row.verse_text}|{row.verse_reference}" for row in batch_rows],
     )
     temp_dir = WORK_DIR / f"batch_{token}"
@@ -1626,13 +1727,17 @@ def render_batch_section(
         with st.spinner(f"Rendering {batch_count} preview video(s)..."):
             source_dir = temp_dir / "backgrounds"
             music_dir = temp_dir / "music"
+            narration_dir = temp_dir / "narration"
             source_dir.mkdir(parents=True, exist_ok=True)
             music_dir.mkdir(parents=True, exist_ok=True)
+            narration_dir.mkdir(parents=True, exist_ok=True)
             for index, row in enumerate(batch_rows):
                 background_file = repeated_file_for_index(background_files, index)
                 music_file = repeated_file_for_index(music_files, index)
+                narration_file = repeated_file_for_index(narration_files, index) if narration_files else None
                 background_upload_path = save_upload(background_file, source_dir / f"{index + 1:02d}_{background_file.name}")
                 audio_path = save_upload(music_file, music_dir / f"{index + 1:02d}_{music_file.name}")
+                narration_path = save_upload(narration_file, narration_dir / f"{index + 1:02d}_{narration_file.name}") if narration_file else None
                 if is_background_video(background_upload_path):
                     background_path = background_upload_path
                 else:
@@ -1644,6 +1749,9 @@ def render_batch_section(
                     text_overlay_path,
                     logo_overlay_path,
                     audio_path,
+                    narration_path,
+                    row.verse_text if narration_path else None,
+                    caption_position,
                     preview_paths[index],
                     min(duration, PREVIEW_DURATION_SECONDS),
                     "2500k",
@@ -1656,24 +1764,43 @@ def render_batch_section(
     preview_complete = st.session_state.get("batch_preview_token") == token
     if preview_complete and all(path.exists() for path in preview_paths):
         st.subheader("Batch Previews")
-        for index, path in enumerate(preview_paths):
-            st.caption(f"Preview {index + 1}: {batch_rows[index].date_text} - {batch_rows[index].verse_reference}")
-            st.video(str(path))
+        for row_start in range(0, len(preview_paths), 4):
+            columns = st.columns(4)
+            for offset, column in enumerate(columns):
+                index = row_start + offset
+                if index >= len(preview_paths):
+                    continue
+                with column:
+                    st.caption(f"{index + 1}. {batch_rows[index].date_text}")
+                    st.video(str(preview_paths[index]))
+                    if st.button("Open", key=f"batch_open_preview_{token}_{index}"):
+                        st.session_state["batch_selected_preview"] = index
+
+        selected_preview = st.session_state.get("batch_selected_preview")
+        if selected_preview is not None and 0 <= selected_preview < len(preview_paths):
+            st.subheader(f"Selected Preview {selected_preview + 1}")
+            st.caption(f"{batch_rows[selected_preview].date_text} - {batch_rows[selected_preview].verse_reference}")
+            st.video(str(preview_paths[selected_preview]))
 
         approved = st.checkbox("I approve these previews and want to render all final MP4 files", key="batch_approve_final")
         if approved and st.button("Generate Batch Final MP4s", key="batch_generate_final"):
             with st.spinner(f"Rendering {batch_count} final video(s)..."):
                 source_dir = temp_dir / "backgrounds"
                 music_dir = temp_dir / "music"
+                narration_dir = temp_dir / "narration"
                 for index, row in enumerate(batch_rows):
                     background_file = repeated_file_for_index(background_files, index)
                     music_file = repeated_file_for_index(music_files, index)
+                    narration_file = repeated_file_for_index(narration_files, index) if narration_files else None
                     background_upload_path = source_dir / f"{index + 1:02d}_{background_file.name}"
                     audio_path = music_dir / f"{index + 1:02d}_{music_file.name}"
+                    narration_path = narration_dir / f"{index + 1:02d}_{narration_file.name}" if narration_file else None
                     if not background_upload_path.exists():
                         background_upload_path = save_upload(background_file, background_upload_path)
                     if not audio_path.exists():
                         audio_path = save_upload(music_file, audio_path)
+                    if narration_file and narration_path and not narration_path.exists():
+                        narration_path = save_upload(narration_file, narration_path)
                     if is_background_video(background_upload_path):
                         background_path = background_upload_path
                     else:
@@ -1685,6 +1812,9 @@ def render_batch_section(
                         text_overlay_path,
                         logo_overlay_path,
                         audio_path,
+                        narration_path,
+                        row.verse_text if narration_path else None,
+                        caption_position,
                         final_paths[index],
                         duration,
                         "8000k",
@@ -1745,9 +1875,14 @@ def main() -> None:
         sheet_file = None
         background_files = None
         music_files = None
+        narration_files = []
         background_file = None
+        narration_file = None
         repeat_backgrounds = False
         repeat_music = False
+        repeat_narration = False
+        add_narration = st.toggle("Add narration VO audio", value=False)
+        caption_position = "Bottom"
         if batch_mode:
             batch_count = st.number_input("Number of videos to create", min_value=1, max_value=10, value=1, step=1)
             sheet_file = st.file_uploader("Upload Excel sheet with Date, Verses, and Chapter number", type=["xlsx", "xls"])
@@ -1763,12 +1898,21 @@ def main() -> None:
                 type=["mp3", "wav", "m4a", "aac", "ogg"],
                 accept_multiple_files=True,
             )
+            if add_narration:
+                repeat_narration = st.toggle("Repeat uploaded narration VO if fewer than video count", value=False)
+                narration_files = st.file_uploader(
+                    f"Upload narration VO file(s){' to repeat' if repeat_narration else f' ({batch_count} required)'}",
+                    type=["mp3", "wav", "m4a", "aac", "ogg"],
+                    accept_multiple_files=True,
+                )
         else:
             background_file = st.file_uploader(
                 "Upload background image or video",
                 type=["jpg", "jpeg", "png", "webp", "mp4", "mov", "m4v", "webm"],
             )
             music_file = st.file_uploader("Upload background music", type=["mp3", "wav", "m4a", "aac", "ogg"])
+            if add_narration:
+                narration_file = st.file_uploader("Upload narration VO audio", type=["mp3", "wav", "m4a", "aac", "ogg"])
         if batch_mode:
             music_file = None
         logo_file = st.file_uploader("Upload logo image", type=["png", "jpg", "jpeg", "webp"])
@@ -1782,6 +1926,11 @@ def main() -> None:
             verse_reference = ""
             verse_text = ""
         duration = st.slider("Video duration", min_value=5, max_value=MAX_DURATION_SECONDS, value=30, step=1)
+
+        if add_narration:
+            with st.expander("Closed captions", expanded=True):
+                caption_position = st.selectbox("Caption position", CAPTION_POSITIONS, index=0)
+                st.caption("Captions are generated from the verse text for each video and timed across the narration.")
 
         with st.expander("Text style", expanded=True):
             font_family = st.selectbox("Font", FONT_FAMILIES, index=0)
@@ -1880,6 +2029,7 @@ def main() -> None:
                     st.error(str(error))
             background_count = len(background_files) if background_files else 0
             music_count = len(music_files) if music_files else 0
+            narration_count = len(narration_files) if narration_files else 0
             if background_files and not repeat_backgrounds and background_count != int(batch_count):
                 st.error(f"Please upload exactly {batch_count} background image/video file(s). You uploaded {background_count}.")
             if background_files and repeat_backgrounds and background_count < 1:
@@ -1888,15 +2038,22 @@ def main() -> None:
                 st.error(f"Please upload exactly {batch_count} background music file(s). You uploaded {music_count}.")
             if music_files and repeat_music and music_count < 1:
                 st.error("Please upload at least one background music file to repeat.")
+            if add_narration and narration_files and not repeat_narration and narration_count != int(batch_count):
+                st.error(f"Please upload exactly {batch_count} narration VO file(s). You uploaded {narration_count}.")
+            if add_narration and narration_files and repeat_narration and narration_count < 1:
+                st.error("Please upload at least one narration VO file to repeat.")
             background_ready = bool(background_files) and (repeat_backgrounds or background_count == int(batch_count))
             music_ready = bool(music_files) and (repeat_music or music_count == int(batch_count))
-            ready = all([batch_sheet_ready, background_ready, music_ready])
+            narration_ready = (not add_narration) or (bool(narration_files) and (repeat_narration or narration_count == int(batch_count)))
+            ready = all([batch_sheet_ready, background_ready, music_ready, narration_ready])
             if ready:
                 render_batch_section(
                     batch_rows,
                     style,
                     background_files,
                     music_files,
+                    narration_files if add_narration else [],
+                    caption_position,
                     logo_file,
                     logo_style,
                     duration,
@@ -1904,9 +2061,13 @@ def main() -> None:
                     use_gpu,
                 )
             else:
-                st.info("Complete the batch count, Excel sheet, background files, and music files to begin. Exact counts are required unless repeat is enabled.")
+                st.info("Complete the batch count, Excel sheet, background files, music files, and any requested VO files to begin. Exact counts are required unless repeat is enabled.")
                 st.button("Create Batch Previews", disabled=True, key="batch_preview_disabled_incomplete")
         elif all([background_file, music_file, date_text.strip(), verse_reference.strip(), verse_text.strip()]):
+            if add_narration and not narration_file:
+                st.info("Upload narration VO audio or turn off narration.")
+                st.button("Create Preview", disabled=True, key="bible_preview_disabled_no_vo")
+                return
             details = VideoDetails(
                 date_text=date_text.strip(),
                 verse_reference=verse_reference.strip(),
@@ -1918,6 +2079,8 @@ def main() -> None:
                 style,
                 background_file,
                 music_file,
+                narration_file if add_narration else None,
+                caption_position,
                 logo_file,
                 logo_style,
                 include_background_video_audio,
