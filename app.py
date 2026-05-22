@@ -124,6 +124,13 @@ class TextStyle:
     show_reference_box: bool
 
 
+@dataclass(frozen=True)
+class LogoStyle:
+    size_percent: int
+    position: str
+    opacity: int
+
+
 def save_upload(uploaded_file, destination: Path) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
     with destination.open("wb") as file:
@@ -560,6 +567,45 @@ def create_blurred_text_overlay(text_overlay_path: Path, output_path: Path) -> P
     return output_path
 
 
+def logo_position_coordinates(logo_size: tuple[int, int], position: str, margin: int = 60) -> tuple[int, int]:
+    logo_width, logo_height = logo_size
+    horizontal = {
+        "Left": margin,
+        "Middle": (WIDTH - logo_width) // 2,
+        "Right": WIDTH - logo_width - margin,
+    }
+    vertical = {
+        "Top": margin,
+        "Middle": (HEIGHT - logo_height) // 2,
+        "Bottom": HEIGHT - logo_height - margin,
+    }
+
+    parts = position.split()
+    if len(parts) == 1 and parts[0] == "Center":
+        return horizontal["Middle"], vertical["Middle"]
+    if parts[0] == "Middle":
+        return horizontal[parts[1]], vertical["Middle"]
+    return horizontal[parts[1]], vertical[parts[0]]
+
+
+def create_logo_overlay(logo_path: Path, style: LogoStyle, output_path: Path) -> Path:
+    logo = Image.open(logo_path).convert("RGBA")
+    target_width = max(24, int(WIDTH * (style.size_percent / 100)))
+    target_height = max(1, int(logo.height * (target_width / logo.width)))
+    logo = logo.resize((target_width, target_height), Image.Resampling.LANCZOS)
+
+    if style.opacity < 100:
+        alpha = logo.getchannel("A")
+        alpha = alpha.point(lambda value: int(value * style.opacity / 100))
+        logo.putalpha(alpha)
+
+    overlay = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
+    overlay.alpha_composite(logo, logo_position_coordinates(logo.size, style.position))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    overlay.save(output_path)
+    return output_path
+
+
 def create_frame(image_path: Path, details: VideoDetails, style: TextStyle, output_path: Path) -> Path:
     frame = fit_image_to_short(image_path)
     overlay = Image.open(create_text_overlay(details, style, output_path.parent / "text_overlay.png")).convert("RGBA")
@@ -671,6 +717,7 @@ def animated_alpha_mask(image_path: Path, duration: float, opacity_function) -> 
 def render_video(
     background_path: Path,
     text_overlay_path: Path,
+    logo_overlay_path: Path | None,
     audio_path: Path,
     output_path: Path,
     duration: int,
@@ -698,7 +745,13 @@ def render_video(
     blurred_text = clip_with_mask(blurred_text, blurred_mask)
     sharp_text = sharp_text.with_position(("center", "center")) if hasattr(sharp_text, "with_position") else sharp_text.set_position(("center", "center"))
     blurred_text = blurred_text.with_position(("center", "center")) if hasattr(blurred_text, "with_position") else blurred_text.set_position(("center", "center"))
-    video = CompositeVideoClip([background, blurred_text, sharp_text], size=(WIDTH, HEIGHT))
+    layers = [background, blurred_text, sharp_text]
+    logo_clip = None
+    if logo_overlay_path:
+        logo_clip = clip_with_duration(ImageClip(str(logo_overlay_path)), render_duration)
+        logo_clip = logo_clip.with_position(("center", "center")) if hasattr(logo_clip, "with_position") else logo_clip.set_position(("center", "center"))
+        layers.append(logo_clip)
+    video = CompositeVideoClip(layers, size=(WIDTH, HEIGHT))
     video = clip_with_audio(video, audio)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -709,6 +762,8 @@ def render_video(
     background.close()
     if background_source:
         background_source.close()
+    if logo_clip:
+        logo_clip.close()
     blurred_text.close()
     sharp_text.close()
     blurred_mask.close()
@@ -1330,11 +1385,19 @@ def style_digest(style: TextStyle) -> str:
     )
 
 
+def logo_style_digest(logo_style: LogoStyle | None) -> str:
+    if not logo_style:
+        return "no-logo"
+    return "|".join([str(logo_style.size_percent), logo_style.position, str(logo_style.opacity)])
+
+
 def render_section(
     details: VideoDetails,
     style: TextStyle,
     background_file,
     music_file,
+    logo_file,
+    logo_style: LogoStyle | None,
     include_background_video_audio: bool,
     use_gpu: bool,
 ) -> None:
@@ -1349,6 +1412,9 @@ def render_section(
         str(background_file.size),
         music_file.name,
         str(music_file.size),
+        logo_file.name if logo_file else "no-logo",
+        str(logo_file.size) if logo_file else "0",
+        logo_style_digest(logo_style),
         str(include_background_video_audio),
         str(use_gpu),
     )
@@ -1360,6 +1426,10 @@ def render_section(
     else:
         background_path = create_background_frame(background_upload_path, temp_dir / "background.jpg")
     text_overlay_path = create_text_overlay(details, style, temp_dir / "text_overlay.png")
+    logo_overlay_path = None
+    if logo_file and logo_style:
+        logo_upload_path = save_upload(logo_file, temp_dir / logo_file.name)
+        logo_overlay_path = create_logo_overlay(logo_upload_path, logo_style, temp_dir / "logo_overlay.png")
     preview_path = temp_dir / "preview.mp4"
     final_path = temp_dir / "youtube_short_final.mp4"
 
@@ -1368,6 +1438,7 @@ def render_section(
             render_video(
                 background_path,
                 text_overlay_path,
+                logo_overlay_path,
                 audio_path,
                 preview_path,
                 min(details.duration, PREVIEW_DURATION_SECONDS),
@@ -1393,6 +1464,7 @@ def render_section(
                 render_video(
                     background_path,
                     text_overlay_path,
+                    logo_overlay_path,
                     audio_path,
                     final_path,
                     details.duration,
@@ -1456,6 +1528,7 @@ def main() -> None:
             type=["jpg", "jpeg", "png", "webp", "mp4", "mov", "m4v", "webm"],
         )
         music_file = st.file_uploader("Upload background music", type=["mp3", "wav", "m4a", "aac", "ogg"])
+        logo_file = st.file_uploader("Upload logo image", type=["png", "jpg", "jpeg", "webp"])
 
         date_text = st.text_input("Current date", placeholder="20 May 2026")
         verse_reference = st.text_input("Bible chapter and verse", placeholder="Psalm 23: 1")
@@ -1485,6 +1558,24 @@ def main() -> None:
                 show_verse_box = st.toggle("Verse box", value=True)
             with box_col3:
                 show_reference_box = st.toggle("Reference box", value=True)
+
+        with st.expander("Logo", expanded=False):
+            logo_positions = [
+                "Top Left",
+                "Top Middle",
+                "Top Right",
+                "Middle Left",
+                "Center",
+                "Middle Right",
+                "Bottom Left",
+                "Bottom Middle",
+                "Bottom Right",
+            ]
+            logo_size_percent = st.slider("Logo size (% of video width)", min_value=5, max_value=50, value=14, step=1)
+            logo_position = st.selectbox("Logo position", logo_positions, index=2)
+            logo_opacity = st.slider("Logo opacity", min_value=0, max_value=100, value=85, step=5)
+            if logo_file is None:
+                st.info("Upload a logo image to show it on the video.")
 
         with st.expander("Video rendering", expanded=False):
             background_is_video = background_file is not None and is_background_video(background_file.name)
@@ -1516,6 +1607,15 @@ def main() -> None:
             show_verse_box=show_verse_box,
             show_reference_box=show_reference_box,
         )
+        logo_style = (
+            LogoStyle(
+                size_percent=logo_size_percent,
+                position=logo_position,
+                opacity=logo_opacity,
+            )
+            if logo_file
+            else None
+        )
 
         ready = all([background_file, music_file, date_text.strip(), verse_reference.strip(), verse_text.strip()])
         if ready:
@@ -1525,7 +1625,16 @@ def main() -> None:
                 verse_text=verse_text.strip(),
                 duration=duration,
             )
-            render_section(details, style, background_file, music_file, include_background_video_audio, use_gpu)
+            render_section(
+                details,
+                style,
+                background_file,
+                music_file,
+                logo_file,
+                logo_style,
+                include_background_video_audio,
+                use_gpu,
+            )
         else:
             st.info("Complete all fields above. The Create Preview button will appear after the image, music, date, Bible reference, and verse text are provided.")
             st.button("Create Preview", disabled=True, key="bible_preview_disabled_incomplete")
