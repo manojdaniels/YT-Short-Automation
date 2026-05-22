@@ -1579,11 +1579,15 @@ def render_section(
                 )
 
 
+def repeated_file_for_index(files, index: int):
+    return files[index % len(files)]
+
+
 def render_batch_section(
     batch_rows: list[VideoDetails],
     style: TextStyle,
     background_files,
-    music_file,
+    music_files,
     logo_file,
     logo_style: LogoStyle | None,
     duration: int,
@@ -1597,15 +1601,14 @@ def render_batch_section(
         style_digest(style),
         logo_file.name if logo_file else "no-logo",
         str(logo_file.size) if logo_file else "0",
-        music_file.name,
-        str(music_file.size),
         str(duration),
         str(include_background_video_audio),
         str(use_gpu),
+        *[f"bg:{file.name}:{file.size}" for file in background_files],
+        *[f"music:{file.name}:{file.size}" for file in music_files],
         *[f"{row.date_text}|{row.verse_text}|{row.verse_reference}" for row in batch_rows],
     )
     temp_dir = WORK_DIR / f"batch_{token}"
-    audio_path = save_upload(music_file, temp_dir / music_file.name)
     logo_overlay_path = None
     if logo_file and logo_style:
         logo_upload_path = save_upload(logo_file, temp_dir / logo_file.name)
@@ -1622,9 +1625,14 @@ def render_batch_section(
     if st.button("Create Batch Previews", type="primary", key="batch_create_previews"):
         with st.spinner(f"Rendering {batch_count} preview video(s)..."):
             source_dir = temp_dir / "backgrounds"
+            music_dir = temp_dir / "music"
             source_dir.mkdir(parents=True, exist_ok=True)
-            for index, (row, background_file) in enumerate(zip(batch_rows, background_files)):
+            music_dir.mkdir(parents=True, exist_ok=True)
+            for index, row in enumerate(batch_rows):
+                background_file = repeated_file_for_index(background_files, index)
+                music_file = repeated_file_for_index(music_files, index)
                 background_upload_path = save_upload(background_file, source_dir / f"{index + 1:02d}_{background_file.name}")
+                audio_path = save_upload(music_file, music_dir / f"{index + 1:02d}_{music_file.name}")
                 if is_background_video(background_upload_path):
                     background_path = background_upload_path
                 else:
@@ -1656,10 +1664,16 @@ def render_batch_section(
         if approved and st.button("Generate Batch Final MP4s", key="batch_generate_final"):
             with st.spinner(f"Rendering {batch_count} final video(s)..."):
                 source_dir = temp_dir / "backgrounds"
-                for index, (row, background_file) in enumerate(zip(batch_rows, background_files)):
+                music_dir = temp_dir / "music"
+                for index, row in enumerate(batch_rows):
+                    background_file = repeated_file_for_index(background_files, index)
+                    music_file = repeated_file_for_index(music_files, index)
                     background_upload_path = source_dir / f"{index + 1:02d}_{background_file.name}"
+                    audio_path = music_dir / f"{index + 1:02d}_{music_file.name}"
                     if not background_upload_path.exists():
                         background_upload_path = save_upload(background_file, background_upload_path)
+                    if not audio_path.exists():
+                        audio_path = save_upload(music_file, audio_path)
                     if is_background_video(background_upload_path):
                         background_path = background_upload_path
                     else:
@@ -1730,13 +1744,23 @@ def main() -> None:
         batch_count = 1
         sheet_file = None
         background_files = None
+        music_files = None
         background_file = None
+        repeat_backgrounds = False
+        repeat_music = False
         if batch_mode:
             batch_count = st.number_input("Number of videos to create", min_value=1, max_value=10, value=1, step=1)
             sheet_file = st.file_uploader("Upload Excel sheet with Date, Verses, and Chapter number", type=["xlsx", "xls"])
+            repeat_backgrounds = st.toggle("Repeat uploaded backgrounds if fewer than video count", value=False)
             background_files = st.file_uploader(
-                f"Upload {batch_count} background image/video file(s)",
+                f"Upload background image/video file(s){' to repeat' if repeat_backgrounds else f' ({batch_count} required)'}",
                 type=["jpg", "jpeg", "png", "webp", "mp4", "mov", "m4v", "webm"],
+                accept_multiple_files=True,
+            )
+            repeat_music = st.toggle("Repeat uploaded background music if fewer than video count", value=False)
+            music_files = st.file_uploader(
+                f"Upload background music file(s){' to repeat' if repeat_music else f' ({batch_count} required)'}",
+                type=["mp3", "wav", "m4a", "aac", "ogg"],
                 accept_multiple_files=True,
             )
         else:
@@ -1744,7 +1768,9 @@ def main() -> None:
                 "Upload background image or video",
                 type=["jpg", "jpeg", "png", "webp", "mp4", "mov", "m4v", "webm"],
             )
-        music_file = st.file_uploader("Upload background music", type=["mp3", "wav", "m4a", "aac", "ogg"])
+            music_file = st.file_uploader("Upload background music", type=["mp3", "wav", "m4a", "aac", "ogg"])
+        if batch_mode:
+            music_file = None
         logo_file = st.file_uploader("Upload logo image", type=["png", "jpg", "jpeg", "webp"])
 
         if not batch_mode:
@@ -1853,15 +1879,24 @@ def main() -> None:
                 except Exception as error:
                     st.error(str(error))
             background_count = len(background_files) if background_files else 0
-            if background_files and background_count != int(batch_count):
+            music_count = len(music_files) if music_files else 0
+            if background_files and not repeat_backgrounds and background_count != int(batch_count):
                 st.error(f"Please upload exactly {batch_count} background image/video file(s). You uploaded {background_count}.")
-            ready = all([batch_sheet_ready, background_files, background_count == int(batch_count), music_file])
+            if background_files and repeat_backgrounds and background_count < 1:
+                st.error("Please upload at least one background image/video file to repeat.")
+            if music_files and not repeat_music and music_count != int(batch_count):
+                st.error(f"Please upload exactly {batch_count} background music file(s). You uploaded {music_count}.")
+            if music_files and repeat_music and music_count < 1:
+                st.error("Please upload at least one background music file to repeat.")
+            background_ready = bool(background_files) and (repeat_backgrounds or background_count == int(batch_count))
+            music_ready = bool(music_files) and (repeat_music or music_count == int(batch_count))
+            ready = all([batch_sheet_ready, background_ready, music_ready])
             if ready:
                 render_batch_section(
                     batch_rows,
                     style,
                     background_files,
-                    music_file,
+                    music_files,
                     logo_file,
                     logo_style,
                     duration,
@@ -1869,7 +1904,7 @@ def main() -> None:
                     use_gpu,
                 )
             else:
-                st.info("Complete the batch count, Excel sheet, exact number of background files, and background music to begin.")
+                st.info("Complete the batch count, Excel sheet, background files, and music files to begin. Exact counts are required unless repeat is enabled.")
                 st.button("Create Batch Previews", disabled=True, key="batch_preview_disabled_incomplete")
         elif all([background_file, music_file, date_text.strip(), verse_reference.strip(), verse_text.strip()]):
             details = VideoDetails(
