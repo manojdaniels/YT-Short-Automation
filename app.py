@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
@@ -1367,6 +1368,87 @@ def probe_duration(video_path: Path) -> float | None:
         return None
 
 
+def format_excel_value(value) -> str:
+    if pd.isna(value):
+        return ""
+    if hasattr(value, "strftime"):
+        return value.strftime("%B %d, %Y")
+    return str(value).strip()
+
+
+def find_excel_column(columns: list[str], candidates: list[str]) -> str | None:
+    normalized = {str(column).strip().lower(): column for column in columns}
+    for candidate in candidates:
+        if candidate in normalized:
+            return normalized[candidate]
+    for key, original in normalized.items():
+        if any(candidate in key for candidate in candidates):
+            return original
+    return None
+
+
+def read_batch_rows(sheet_file, expected_count: int) -> tuple[list[VideoDetails], pd.DataFrame]:
+    dataframe = pd.read_excel(sheet_file)
+    dataframe = dataframe.dropna(how="all").reset_index(drop=True)
+    date_col = find_excel_column(list(dataframe.columns), ["date", "current date"])
+    verse_col = find_excel_column(list(dataframe.columns), ["verse", "verses", "bible verse", "verse text"])
+    reference_col = find_excel_column(
+        list(dataframe.columns),
+        ["chapter", "chapter number", "chapter verse", "chapter and verse", "reference", "verse number"],
+    )
+    missing = [
+        label
+        for label, column in [("Date", date_col), ("Verses", verse_col), ("Chapter/verse number", reference_col)]
+        if column is None
+    ]
+    if missing:
+        raise ValueError(f"Missing required Excel column(s): {', '.join(missing)}")
+    if len(dataframe) < expected_count:
+        raise ValueError(f"The Excel sheet has {len(dataframe)} usable row(s), but {expected_count} video(s) were requested.")
+
+    rows: list[VideoDetails] = []
+    for _, row in dataframe.head(expected_count).iterrows():
+        rows.append(
+            VideoDetails(
+                date_text=format_excel_value(row[date_col]),
+                verse_reference=format_excel_value(row[reference_col]),
+                verse_text=format_excel_value(row[verse_col]),
+                duration=0,
+            )
+        )
+    return rows, dataframe.head(expected_count).copy()
+
+
+def display_batch_rows(rows: list[VideoDetails], completed_indexes: set[int]) -> None:
+    dataframe = pd.DataFrame(
+        [
+            {
+                "Row": index + 1,
+                "Date": row.date_text,
+                "Verses": row.verse_text,
+                "Chapter/Verse": row.verse_reference,
+                "Status": "Completed" if index in completed_indexes else "Pending",
+            }
+            for index, row in enumerate(rows)
+        ]
+    )
+
+    def highlight_completed(row):
+        color = "background-color: #D1FADF" if row["Status"] == "Completed" else ""
+        return [color] * len(row)
+
+    st.dataframe(dataframe.style.apply(highlight_completed, axis=1), use_container_width=True)
+
+
+def zip_video_files(video_paths: list[Path]) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for video_path in video_paths:
+            archive.write(video_path, arcname=video_path.name)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 def style_digest(style: TextStyle) -> str:
     return "|".join(
         [
@@ -1497,6 +1579,127 @@ def render_section(
                 )
 
 
+def render_batch_section(
+    batch_rows: list[VideoDetails],
+    style: TextStyle,
+    background_files,
+    music_file,
+    logo_file,
+    logo_style: LogoStyle | None,
+    duration: int,
+    include_background_video_audio: bool,
+    use_gpu: bool,
+) -> None:
+    WORK_DIR.mkdir(exist_ok=True)
+    batch_count = len(batch_rows)
+    token = uploaded_files_digest(
+        background_files,
+        style_digest(style),
+        logo_file.name if logo_file else "no-logo",
+        str(logo_file.size) if logo_file else "0",
+        music_file.name,
+        str(music_file.size),
+        str(duration),
+        str(include_background_video_audio),
+        str(use_gpu),
+        *[f"{row.date_text}|{row.verse_text}|{row.verse_reference}" for row in batch_rows],
+    )
+    temp_dir = WORK_DIR / f"batch_{token}"
+    audio_path = save_upload(music_file, temp_dir / music_file.name)
+    logo_overlay_path = None
+    if logo_file and logo_style:
+        logo_upload_path = save_upload(logo_file, temp_dir / logo_file.name)
+        logo_overlay_path = create_logo_overlay(logo_upload_path, logo_style, temp_dir / "logo_overlay.png")
+
+    preview_paths = [temp_dir / f"preview_{index + 1:02d}.mp4" for index in range(batch_count)]
+    final_paths = [temp_dir / f"youtube_short_{index + 1:02d}.mp4" for index in range(batch_count)]
+
+    preview_complete = st.session_state.get("batch_preview_token") == token
+    final_complete = st.session_state.get("batch_final_token") == token
+    completed_indexes = set(range(batch_count)) if final_complete else set()
+    display_batch_rows(batch_rows, completed_indexes)
+
+    if st.button("Create Batch Previews", type="primary", key="batch_create_previews"):
+        with st.spinner(f"Rendering {batch_count} preview video(s)..."):
+            source_dir = temp_dir / "backgrounds"
+            source_dir.mkdir(parents=True, exist_ok=True)
+            for index, (row, background_file) in enumerate(zip(batch_rows, background_files)):
+                background_upload_path = save_upload(background_file, source_dir / f"{index + 1:02d}_{background_file.name}")
+                if is_background_video(background_upload_path):
+                    background_path = background_upload_path
+                else:
+                    background_path = create_background_frame(background_upload_path, temp_dir / f"background_{index + 1:02d}.jpg")
+                row_details = VideoDetails(row.date_text, row.verse_reference, row.verse_text, duration)
+                text_overlay_path = create_text_overlay(row_details, style, temp_dir / f"text_overlay_{index + 1:02d}.png")
+                render_video(
+                    background_path,
+                    text_overlay_path,
+                    logo_overlay_path,
+                    audio_path,
+                    preview_paths[index],
+                    min(duration, PREVIEW_DURATION_SECONDS),
+                    "2500k",
+                    include_background_video_audio,
+                    use_gpu,
+                )
+        st.session_state["batch_preview_token"] = token
+        st.session_state.pop("batch_final_token", None)
+
+    preview_complete = st.session_state.get("batch_preview_token") == token
+    if preview_complete and all(path.exists() for path in preview_paths):
+        st.subheader("Batch Previews")
+        for index, path in enumerate(preview_paths):
+            st.caption(f"Preview {index + 1}: {batch_rows[index].date_text} - {batch_rows[index].verse_reference}")
+            st.video(str(path))
+
+        approved = st.checkbox("I approve these previews and want to render all final MP4 files", key="batch_approve_final")
+        if approved and st.button("Generate Batch Final MP4s", key="batch_generate_final"):
+            with st.spinner(f"Rendering {batch_count} final video(s)..."):
+                source_dir = temp_dir / "backgrounds"
+                for index, (row, background_file) in enumerate(zip(batch_rows, background_files)):
+                    background_upload_path = source_dir / f"{index + 1:02d}_{background_file.name}"
+                    if not background_upload_path.exists():
+                        background_upload_path = save_upload(background_file, background_upload_path)
+                    if is_background_video(background_upload_path):
+                        background_path = background_upload_path
+                    else:
+                        background_path = create_background_frame(background_upload_path, temp_dir / f"background_{index + 1:02d}.jpg")
+                    row_details = VideoDetails(row.date_text, row.verse_reference, row.verse_text, duration)
+                    text_overlay_path = create_text_overlay(row_details, style, temp_dir / f"text_overlay_{index + 1:02d}.png")
+                    render_video(
+                        background_path,
+                        text_overlay_path,
+                        logo_overlay_path,
+                        audio_path,
+                        final_paths[index],
+                        duration,
+                        "8000k",
+                        include_background_video_audio,
+                        use_gpu,
+                    )
+            st.session_state["batch_final_token"] = token
+
+    final_complete = st.session_state.get("batch_final_token") == token
+    if final_complete and all(path.exists() for path in final_paths):
+        st.success("Batch final MP4 files generated.")
+        display_batch_rows(batch_rows, set(range(batch_count)))
+        st.write(
+            {
+                "videos": batch_count,
+                "format": "MP4",
+                "resolution": f"{WIDTH}x{HEIGHT}",
+                "duration_seconds_each": duration,
+            }
+        )
+        st.download_button(
+            "Download All Final MP4s",
+            data=zip_video_files(final_paths),
+            file_name="youtube_shorts_batch.zip",
+            mime="application/zip",
+            key="batch_download_zip",
+        )
+
+
 def main() -> None:
     st.set_page_config(page_title="Python Video Builder", layout="centered")
     st.title("Python Video Builder")
@@ -1523,16 +1726,35 @@ def main() -> None:
     with bible_tab:
         st.caption("Creates vertical MP4 videos at 1080x1920, 9:16, up to 60 seconds.")
 
-        background_file = st.file_uploader(
-            "Upload background image or video",
-            type=["jpg", "jpeg", "png", "webp", "mp4", "mov", "m4v", "webm"],
-        )
+        batch_mode = st.toggle("Automate batch video process", value=False)
+        batch_count = 1
+        sheet_file = None
+        background_files = None
+        background_file = None
+        if batch_mode:
+            batch_count = st.number_input("Number of videos to create", min_value=1, max_value=10, value=1, step=1)
+            sheet_file = st.file_uploader("Upload Excel sheet with Date, Verses, and Chapter number", type=["xlsx", "xls"])
+            background_files = st.file_uploader(
+                f"Upload {batch_count} background image/video file(s)",
+                type=["jpg", "jpeg", "png", "webp", "mp4", "mov", "m4v", "webm"],
+                accept_multiple_files=True,
+            )
+        else:
+            background_file = st.file_uploader(
+                "Upload background image or video",
+                type=["jpg", "jpeg", "png", "webp", "mp4", "mov", "m4v", "webm"],
+            )
         music_file = st.file_uploader("Upload background music", type=["mp3", "wav", "m4a", "aac", "ogg"])
         logo_file = st.file_uploader("Upload logo image", type=["png", "jpg", "jpeg", "webp"])
 
-        date_text = st.text_input("Current date", placeholder="20 May 2026")
-        verse_reference = st.text_input("Bible chapter and verse", placeholder="Psalm 23: 1")
-        verse_text = st.text_area("Bible verse text", placeholder="The Lord is my shepherd; I shall not want.")
+        if not batch_mode:
+            date_text = st.text_input("Current date", placeholder="20 May 2026")
+            verse_reference = st.text_input("Bible chapter and verse", placeholder="Psalm 23: 1")
+            verse_text = st.text_area("Bible verse text", placeholder="The Lord is my shepherd; I shall not want.")
+        else:
+            date_text = ""
+            verse_reference = ""
+            verse_text = ""
         duration = st.slider("Video duration", min_value=5, max_value=MAX_DURATION_SECONDS, value=30, step=1)
 
         with st.expander("Text style", expanded=True):
@@ -1555,7 +1777,7 @@ def main() -> None:
             with box_col1:
                 show_date_box = st.toggle("Date box", value=True)
             with box_col2:
-                show_verse_box = st.toggle("Verse box", value=True)
+                show_verse_box = st.toggle("Verse box", value=False)
             with box_col3:
                 show_reference_box = st.toggle("Reference box", value=True)
 
@@ -1578,7 +1800,10 @@ def main() -> None:
                 st.info("Upload a logo image to show it on the video.")
 
         with st.expander("Video rendering", expanded=False):
-            background_is_video = background_file is not None and is_background_video(background_file.name)
+            if batch_mode:
+                background_is_video = bool(background_files) and any(is_background_video(file.name) for file in background_files)
+            else:
+                background_is_video = background_file is not None and is_background_video(background_file.name)
             include_background_video_audio = st.toggle(
                 "Unmute background video audio",
                 value=False,
@@ -1617,8 +1842,36 @@ def main() -> None:
             else None
         )
 
-        ready = all([background_file, music_file, date_text.strip(), verse_reference.strip(), verse_text.strip()])
-        if ready:
+        if batch_mode:
+            batch_rows: list[VideoDetails] = []
+            batch_sheet_ready = False
+            if sheet_file:
+                try:
+                    batch_rows, _ = read_batch_rows(sheet_file, int(batch_count))
+                    batch_sheet_ready = True
+                    display_batch_rows(batch_rows, set())
+                except Exception as error:
+                    st.error(str(error))
+            background_count = len(background_files) if background_files else 0
+            if background_files and background_count != int(batch_count):
+                st.error(f"Please upload exactly {batch_count} background image/video file(s). You uploaded {background_count}.")
+            ready = all([batch_sheet_ready, background_files, background_count == int(batch_count), music_file])
+            if ready:
+                render_batch_section(
+                    batch_rows,
+                    style,
+                    background_files,
+                    music_file,
+                    logo_file,
+                    logo_style,
+                    duration,
+                    include_background_video_audio,
+                    use_gpu,
+                )
+            else:
+                st.info("Complete the batch count, Excel sheet, exact number of background files, and background music to begin.")
+                st.button("Create Batch Previews", disabled=True, key="batch_preview_disabled_incomplete")
+        elif all([background_file, music_file, date_text.strip(), verse_reference.strip(), verse_text.strip()]):
             details = VideoDetails(
                 date_text=date_text.strip(),
                 verse_reference=verse_reference.strip(),
