@@ -16,11 +16,13 @@ import streamlit as st
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 try:
-    from moviepy import AudioFileClip, CompositeVideoClip, ImageClip, VideoClip
+    from moviepy import AudioFileClip, CompositeAudioClip, CompositeVideoClip, ImageClip, VideoClip, VideoFileClip
     from moviepy.audio.fx import AudioFadeOut
+    from moviepy.video.fx import Loop
 except ImportError:  # moviepy < 2
-    from moviepy.editor import AudioFileClip, CompositeVideoClip, ImageClip, VideoClip
+    from moviepy.editor import AudioFileClip, CompositeAudioClip, CompositeVideoClip, ImageClip, VideoClip, VideoFileClip
     from moviepy.audio.fx import audio_fadeout
+    from moviepy.video.fx import loop
 
 
 WIDTH = 1080
@@ -49,6 +51,7 @@ BOX_OUTLINE = (255, 255, 255, 115)
 BOX_SHADOW = (22, 18, 14, 42)
 WORK_DIR = Path("generated")
 FONT_CACHE_DIR = WORK_DIR / "fonts"
+BACKGROUND_VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm"}
 TEXT_COLOR = (92, 47, 5)
 TEXT_STROKE = (255, 244, 216, 150)
 TEXT_SHADOW = (43, 24, 8, 125)
@@ -574,6 +577,10 @@ def clip_with_audio(video, audio):
     return video.with_audio(audio) if hasattr(video, "with_audio") else video.set_audio(audio)
 
 
+def clip_without_audio(video):
+    return video.without_audio() if hasattr(video, "without_audio") else video.set_audio(None)
+
+
 def clip_with_mask(clip, mask):
     return clip.with_mask(mask) if hasattr(clip, "with_mask") else clip.set_mask(mask)
 
@@ -583,6 +590,54 @@ def apply_audio_fade_out(audio, duration: float):
     if hasattr(audio, "with_effects"):
         return audio.with_effects([AudioFadeOut(fade_duration)])
     return audio_fadeout(audio, fade_duration)
+
+
+def is_background_video(path_or_name: str | Path) -> bool:
+    return Path(str(path_or_name)).suffix.lower() in BACKGROUND_VIDEO_EXTENSIONS
+
+
+def loop_clip_to_duration(clip, duration: float):
+    if clip.duration and clip.duration >= duration:
+        return clip.subclipped(0, duration) if hasattr(clip, "subclipped") else clip.subclip(0, duration)
+    if hasattr(clip, "with_effects"):
+        return clip.with_effects([Loop(duration=duration)])
+    return loop(clip, duration=duration)
+
+
+def fit_clip_to_short(clip):
+    clip_width, clip_height = clip.size
+    scale = max(WIDTH / clip_width, HEIGHT / clip_height)
+    if hasattr(clip, "resized"):
+        clip = clip.resized(scale)
+    else:
+        clip = clip.resize(scale)
+    resized_width, resized_height = clip.size
+    if hasattr(clip, "cropped"):
+        return clip.cropped(x_center=resized_width / 2, y_center=resized_height / 2, width=WIDTH, height=HEIGHT)
+    return clip.crop(x_center=resized_width / 2, y_center=resized_height / 2, width=WIDTH, height=HEIGHT)
+
+
+def create_background_clip(background_path: Path, render_duration: float, include_video_audio: bool):
+    if is_background_video(background_path):
+        source = VideoFileClip(str(background_path))
+        clip = loop_clip_to_duration(source, render_duration)
+        clip = fit_clip_to_short(clip)
+        if hasattr(clip, "resized"):
+            clip = clip.resized(lambda t: 1 + BACKGROUND_ZOOM * (t / render_duration))
+        else:
+            clip = clip.resize(lambda t: 1 + BACKGROUND_ZOOM * (t / render_duration))
+        clip = clip.with_position(("center", "center")) if hasattr(clip, "with_position") else clip.set_position(("center", "center"))
+        if not include_video_audio:
+            clip = clip_without_audio(clip)
+        return clip, source
+
+    background = clip_with_duration(ImageClip(str(background_path)), render_duration)
+    if hasattr(background, "resized"):
+        background = background.resized(lambda t: 1 + BACKGROUND_ZOOM * (t / render_duration))
+    else:
+        background = background.resize(lambda t: 1 + BACKGROUND_ZOOM * (t / render_duration))
+    background = background.with_position(("center", "center")) if hasattr(background, "with_position") else background.set_position(("center", "center"))
+    return background, None
 
 
 def smoothstep(value: float) -> float:
@@ -613,19 +668,26 @@ def animated_alpha_mask(image_path: Path, duration: float, opacity_function) -> 
     return mask
 
 
-def render_video(background_path: Path, text_overlay_path: Path, audio_path: Path, output_path: Path, duration: int, bitrate: str) -> Path:
+def render_video(
+    background_path: Path,
+    text_overlay_path: Path,
+    audio_path: Path,
+    output_path: Path,
+    duration: int,
+    bitrate: str,
+    include_background_video_audio: bool,
+    use_gpu: bool,
+) -> Path:
     audio_clip = AudioFileClip(str(audio_path))
     render_duration = min(duration, MAX_DURATION_SECONDS, audio_clip.duration or MAX_DURATION_SECONDS)
 
-    audio = audio_clip.subclipped(0, render_duration) if hasattr(audio_clip, "subclipped") else audio_clip.subclip(0, render_duration)
+    music_audio = audio_clip.subclipped(0, render_duration) if hasattr(audio_clip, "subclipped") else audio_clip.subclip(0, render_duration)
+    background, background_source = create_background_clip(background_path, render_duration, include_background_video_audio)
+    audio_layers = [music_audio]
+    if include_background_video_audio and getattr(background, "audio", None):
+        audio_layers.append(background.audio)
+    audio = CompositeAudioClip(audio_layers) if len(audio_layers) > 1 else music_audio
     audio = apply_audio_fade_out(audio, render_duration)
-
-    background = clip_with_duration(ImageClip(str(background_path)), render_duration)
-    if hasattr(background, "resized"):
-        background = background.resized(lambda t: 1 + BACKGROUND_ZOOM * (t / render_duration))
-    else:
-        background = background.resize(lambda t: 1 + BACKGROUND_ZOOM * (t / render_duration))
-    background = background.with_position(("center", "center")) if hasattr(background, "with_position") else background.set_position(("center", "center"))
 
     blurred_text_path = create_blurred_text_overlay(text_overlay_path, text_overlay_path.parent / "text_overlay_blur.png")
     sharp_text = clip_with_duration(ImageClip(str(text_overlay_path)), render_duration)
@@ -640,11 +702,13 @@ def render_video(background_path: Path, text_overlay_path: Path, audio_path: Pat
     video = clip_with_audio(video, audio)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    write_mp4_with_gpu_fallback(video, output_path, FPS, bitrate, use_gpu=True, audio_codec="aac")
+    write_mp4_with_gpu_fallback(video, output_path, FPS, bitrate, use_gpu=use_gpu, audio_codec="aac")
 
     audio.close()
     audio_clip.close()
     background.close()
+    if background_source:
+        background_source.close()
     blurred_text.close()
     sharp_text.close()
     blurred_mask.close()
@@ -1266,7 +1330,14 @@ def style_digest(style: TextStyle) -> str:
     )
 
 
-def render_section(details: VideoDetails, style: TextStyle, background_file, music_file) -> None:
+def render_section(
+    details: VideoDetails,
+    style: TextStyle,
+    background_file,
+    music_file,
+    include_background_video_audio: bool,
+    use_gpu: bool,
+) -> None:
     WORK_DIR.mkdir(exist_ok=True)
     token = file_digest(
         details.date_text,
@@ -1274,18 +1345,36 @@ def render_section(details: VideoDetails, style: TextStyle, background_file, mus
         details.verse_text,
         str(details.duration),
         style_digest(style),
+        background_file.name,
+        str(background_file.size),
+        music_file.name,
+        str(music_file.size),
+        str(include_background_video_audio),
+        str(use_gpu),
     )
     temp_dir = WORK_DIR / token
-    image_path = save_upload(background_file, temp_dir / background_file.name)
+    background_upload_path = save_upload(background_file, temp_dir / background_file.name)
     audio_path = save_upload(music_file, temp_dir / music_file.name)
-    background_path = create_background_frame(image_path, temp_dir / "background.jpg")
+    if is_background_video(background_upload_path):
+        background_path = background_upload_path
+    else:
+        background_path = create_background_frame(background_upload_path, temp_dir / "background.jpg")
     text_overlay_path = create_text_overlay(details, style, temp_dir / "text_overlay.png")
     preview_path = temp_dir / "preview.mp4"
     final_path = temp_dir / "youtube_short_final.mp4"
 
     if st.button("Create Preview", type="primary", key="bible_create_preview"):
         with st.spinner("Rendering preview..."):
-            render_video(background_path, text_overlay_path, audio_path, preview_path, min(details.duration, PREVIEW_DURATION_SECONDS), "2500k")
+            render_video(
+                background_path,
+                text_overlay_path,
+                audio_path,
+                preview_path,
+                min(details.duration, PREVIEW_DURATION_SECONDS),
+                "2500k",
+                include_background_video_audio,
+                use_gpu,
+            )
         st.session_state["preview_path"] = str(preview_path)
         st.session_state["final_ready_token"] = token
 
@@ -1301,7 +1390,16 @@ def render_section(details: VideoDetails, style: TextStyle, background_file, mus
         approved = st.checkbox("I approve this preview and want to generate the final MP4", key="bible_approve_final")
         if approved and st.button("Generate Final MP4", key="bible_generate_final"):
             with st.spinner("Rendering final YouTube Short..."):
-                render_video(background_path, text_overlay_path, audio_path, final_path, details.duration, "8000k")
+                render_video(
+                    background_path,
+                    text_overlay_path,
+                    audio_path,
+                    final_path,
+                    details.duration,
+                    "8000k",
+                    include_background_video_audio,
+                    use_gpu,
+                )
             duration = probe_duration(final_path)
             file_size_mb = final_path.stat().st_size / (1024 * 1024)
 
@@ -1353,7 +1451,10 @@ def main() -> None:
     with bible_tab:
         st.caption("Creates vertical MP4 videos at 1080x1920, 9:16, up to 60 seconds.")
 
-        background_file = st.file_uploader("Upload background image", type=["jpg", "jpeg", "png", "webp"])
+        background_file = st.file_uploader(
+            "Upload background image or video",
+            type=["jpg", "jpeg", "png", "webp", "mp4", "mov", "m4v", "webm"],
+        )
         music_file = st.file_uploader("Upload background music", type=["mp3", "wav", "m4a", "aac", "ogg"])
 
         date_text = st.text_input("Current date", placeholder="20 May 2026")
@@ -1385,6 +1486,23 @@ def main() -> None:
             with box_col3:
                 show_reference_box = st.toggle("Reference box", value=True)
 
+        with st.expander("Video rendering", expanded=False):
+            background_is_video = background_file is not None and is_background_video(background_file.name)
+            include_background_video_audio = st.toggle(
+                "Unmute background video audio",
+                value=False,
+                disabled=not background_is_video,
+                help="When enabled, the uploaded video's sound is mixed with the uploaded background music.",
+            )
+            use_gpu = st.toggle("Use NVIDIA GPU/CUDA encoding when available", value=True)
+            gpu_ready = ffmpeg_supports_encoder("h264_nvenc")
+            if use_gpu and gpu_ready:
+                st.success("NVIDIA NVENC/CUDA encoding is available and will be used.")
+            elif use_gpu:
+                st.warning("NVIDIA NVENC/CUDA encoding was not found. The app will fall back to CPU encoding.")
+            else:
+                st.info("GPU encoding is off. The app will use CPU encoding.")
+
         style = TextStyle(
             font_family=font_family,
             text_color=text_color,
@@ -1407,7 +1525,7 @@ def main() -> None:
                 verse_text=verse_text.strip(),
                 duration=duration,
             )
-            render_section(details, style, background_file, music_file)
+            render_section(details, style, background_file, music_file, include_background_video_audio, use_gpu)
         else:
             st.info("Complete all fields above. The Create Preview button will appear after the image, music, date, Bible reference, and verse text are provided.")
             st.button("Create Preview", disabled=True, key="bible_preview_disabled_incomplete")
