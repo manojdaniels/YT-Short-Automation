@@ -1884,27 +1884,34 @@ def main() -> None:
         add_narration = st.toggle("Add narration VO audio", value=False)
         caption_position = "Bottom"
         if batch_mode:
-            batch_count = st.number_input("Number of videos to create", min_value=1, max_value=10, value=1, step=1)
-            sheet_file = st.file_uploader("Upload Excel sheet with Date, Verses, and Chapter number", type=["xlsx", "xls"])
-            repeat_backgrounds = st.toggle("Repeat uploaded backgrounds if fewer than video count", value=False)
-            background_files = st.file_uploader(
-                f"Upload background image/video file(s){' to repeat' if repeat_backgrounds else f' ({batch_count} required)'}",
-                type=["jpg", "jpeg", "png", "webp", "mp4", "mov", "m4v", "webm"],
-                accept_multiple_files=True,
-            )
-            repeat_music = st.toggle("Repeat uploaded background music if fewer than video count", value=False)
-            music_files = st.file_uploader(
-                f"Upload background music file(s){' to repeat' if repeat_music else f' ({batch_count} required)'}",
-                type=["mp3", "wav", "m4a", "aac", "ogg"],
-                accept_multiple_files=True,
-            )
-            if add_narration:
-                repeat_narration = st.toggle("Repeat uploaded narration VO if fewer than video count", value=False)
-                narration_files = st.file_uploader(
-                    f"Upload narration VO file(s){' to repeat' if repeat_narration else f' ({batch_count} required)'}",
+            with st.expander("Batch automation inputs", expanded=True):
+                st.info("Upload an Excel sheet with columns named Date, Verses, and Chapter number. One row will be used for each video.")
+                batch_count = st.number_input("Number of videos to create", min_value=1, max_value=10, value=1, step=1)
+                sheet_file = st.file_uploader(
+                    "Upload Excel sheet (.xlsx/.xls)",
+                    type=["xlsx", "xls"],
+                    help="Required columns: Date, Verses, Chapter number",
+                    key="batch_excel_upload",
+                )
+                repeat_backgrounds = st.toggle("Repeat uploaded backgrounds if fewer than video count", value=False)
+                background_files = st.file_uploader(
+                    f"Upload background image/video file(s){' to repeat' if repeat_backgrounds else f' ({batch_count} required)'}",
+                    type=["jpg", "jpeg", "png", "webp", "mp4", "mov", "m4v", "webm"],
+                    accept_multiple_files=True,
+                )
+                repeat_music = st.toggle("Repeat uploaded background music if fewer than video count", value=False)
+                music_files = st.file_uploader(
+                    f"Upload background music file(s){' to repeat' if repeat_music else f' ({batch_count} required)'}",
                     type=["mp3", "wav", "m4a", "aac", "ogg"],
                     accept_multiple_files=True,
                 )
+                if add_narration:
+                    repeat_narration = st.toggle("Repeat uploaded narration VO if fewer than video count", value=False)
+                    narration_files = st.file_uploader(
+                        f"Upload narration VO file(s){' to repeat' if repeat_narration else f' ({batch_count} required)'}",
+                        type=["mp3", "wav", "m4a", "aac", "ogg"],
+                        accept_multiple_files=True,
+                    )
         else:
             background_file = st.file_uploader(
                 "Upload background image or video",
@@ -1934,7 +1941,7 @@ def main() -> None:
 
         with st.expander("Text style", expanded=True):
             font_family = st.selectbox("Font", FONT_FAMILIES, index=0)
-            text_color = st.color_picker("Text color", "#5C2F05")
+            text_color = st.color_picker("Text color", "#FFFFFF")
             glow_color = st.color_picker("Soft contrast color", "#FFF4D8")
             col1, col2, col3 = st.columns(3)
             with col1:
