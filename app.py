@@ -6,6 +6,7 @@ import math
 import os
 import shutil
 import subprocess
+import asyncio
 import urllib.request
 import zipfile
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import streamlit as st
+import edge_tts
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 try:
@@ -49,6 +51,10 @@ TEXT_BLUR_TRANSITION_SECONDS = 1.8
 TEXT_BLUR_RADIUS = 5
 CAPTION_WORDS_PER_CARD = 7
 CAPTION_POSITIONS = ["Bottom", "Above Reference", "Below Verse", "Above Verse", "Top"]
+TTS_VOICES = {
+    "Female": "en-US-JennyNeural",
+    "Male": "en-US-GuyNeural",
+}
 BOX_FILL = (245, 240, 228, 58)
 BOX_OUTLINE = (255, 255, 255, 115)
 BOX_SHADOW = (22, 18, 14, 42)
@@ -135,6 +141,7 @@ class TextStyle:
     date_size: int
     verse_size: int
     reference_size: int
+    verse_line_spacing: int
     glow_strength: int
     shadow_strength: int
     show_date_box: bool
@@ -405,6 +412,42 @@ def apply_text_case(text: str, text_case: str) -> str:
     return text
 
 
+def tts_cache_key(text: str, voice: str) -> str:
+    return file_digest(text, voice)
+
+
+async def synthesize_tts_async(text: str, voice: str, output_path: Path) -> list[dict]:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    communicate = edge_tts.Communicate(text, voice)
+    word_timings: list[dict] = []
+    audio_chunks: list[bytes] = []
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            audio_chunks.append(chunk["data"])
+        elif chunk["type"] == "WordBoundary":
+            word_timings.append(
+                {
+                    "word": chunk.get("text", ""),
+                    "start": chunk.get("offset", 0) / 10_000_000,
+                    "duration": chunk.get("duration", 0) / 10_000_000,
+                }
+            )
+    output_path.write_bytes(b"".join(audio_chunks))
+    return word_timings
+
+
+def synthesize_tts(text: str, voice_gender: str, output_dir: Path) -> tuple[Path, list[dict]]:
+    voice = TTS_VOICES[voice_gender]
+    key = tts_cache_key(text, voice)
+    audio_path = output_dir / f"tts_{voice_gender.lower()}_{key}.mp3"
+    timings_path = output_dir / f"tts_{voice_gender.lower()}_{key}.json"
+    if audio_path.exists() and timings_path.exists():
+        return audio_path, pd.read_json(timings_path).to_dict("records")
+    word_timings = asyncio.run(synthesize_tts_async(text, voice, audio_path))
+    pd.DataFrame(word_timings).to_json(timings_path, orient="records")
+    return audio_path, word_timings
+
+
 def format_reference(reference: str) -> str:
     normalized = " ".join(reference.split())
     return normalized.replace(" :", ":").replace(": ", ":")
@@ -557,7 +600,7 @@ def create_text_overlay(details: VideoDetails, style: TextStyle, output_path: Pa
         min_size=44 * scale,
         family=style.font_family,
         bold=True,
-        line_gap_ratio=0.1,
+        line_gap_ratio=style.verse_line_spacing / 100,
     )
     verse_height = text_block_height(draw, verse_lines, verse_font, verse_gap)
     verse_y = max((verse_box[1] + 60) * scale, ((verse_box[1] + verse_box[3]) // 2) * scale - (verse_height // 2))
@@ -733,6 +776,71 @@ def create_caption_clips(caption_text: str | None, position: str, duration: floa
     return clips
 
 
+def create_word_highlight_caption_frame(words: list[str], active_index: int, position: str, output_path: Path) -> Path:
+    card_width = 940
+    card_height = 170
+    overlay = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    font = load_named_font(42, "Montserrat", bold=True)
+    x = (WIDTH - card_width) // 2
+    y = caption_y_for_position(position, card_height)
+    draw.rounded_rectangle((x, y, x + card_width, y + card_height), radius=24, fill=(0, 0, 0, 145))
+    draw.rounded_rectangle((x, y, x + card_width, y + card_height), radius=24, outline=(255, 255, 255, 120), width=2)
+
+    word_boxes = []
+    cursor_x = x + 46
+    cursor_y = y + 38
+    space_width = draw.textbbox((0, 0), " ", font=font)[2]
+    line_height = 54
+    for index, word in enumerate(words):
+        bbox = draw.textbbox((0, 0), word, font=font)
+        word_width = bbox[2] - bbox[0]
+        if cursor_x + word_width > x + card_width - 46:
+            cursor_x = x + 46
+            cursor_y += line_height
+        word_boxes.append((index, word, cursor_x, cursor_y, word_width))
+        cursor_x += word_width + space_width
+
+    for index, word, word_x, word_y, word_width in word_boxes:
+        if index == active_index:
+            draw.rounded_rectangle(
+                (word_x - 8, word_y - 4, word_x + word_width + 8, word_y + 46),
+                radius=10,
+                fill=(255, 214, 79, 215),
+            )
+            fill = (36, 24, 8, 255)
+        else:
+            fill = (255, 255, 255, 235)
+        draw.text((word_x, word_y), word, font=font, fill=fill, stroke_width=1, stroke_fill=(0, 0, 0, 160))
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    overlay.save(output_path)
+    return output_path
+
+
+def create_tts_word_caption_clips(word_timings: list[dict] | None, position: str, duration: float, output_dir: Path) -> list:
+    if not word_timings:
+        return []
+    clips = []
+    words = [str(item.get("word", "")).strip() for item in word_timings if str(item.get("word", "")).strip()]
+    timings = [item for item in word_timings if str(item.get("word", "")).strip()]
+    for index, item in enumerate(timings):
+        start = max(0.0, float(item.get("start", 0.0)))
+        end = min(duration, start + max(0.22, float(item.get("duration", 0.35))))
+        window_start = max(0, index - 4)
+        window_words = words[window_start : window_start + 9]
+        active_index = index - window_start
+        frame_path = create_word_highlight_caption_frame(window_words, active_index, position, output_dir / f"word_{index + 1:03d}.png")
+        clip = clip_with_duration(ImageClip(str(frame_path)), max(0.12, end - start))
+        if hasattr(clip, "with_start"):
+            clip = clip.with_start(start)
+        else:
+            clip = clip.set_start(start)
+        clip = clip.with_position(("center", "center")) if hasattr(clip, "with_position") else clip.set_position(("center", "center"))
+        clips.append(clip)
+    return clips
+
+
 def create_frame(image_path: Path, details: VideoDetails, style: TextStyle, output_path: Path) -> Path:
     frame = fit_image_to_short(image_path)
     overlay = Image.open(create_text_overlay(details, style, output_path.parent / "text_overlay.png")).convert("RGBA")
@@ -849,6 +957,7 @@ def render_video(
     narration_path: Path | None,
     caption_text: str | None,
     caption_position: str,
+    tts_word_timings: list[dict] | None,
     output_path: Path,
     duration: int,
     bitrate: str,
@@ -886,7 +995,10 @@ def render_video(
         logo_clip = clip_with_duration(ImageClip(str(logo_overlay_path)), render_duration)
         logo_clip = logo_clip.with_position(("center", "center")) if hasattr(logo_clip, "with_position") else logo_clip.set_position(("center", "center"))
         layers.append(logo_clip)
-    caption_clips = create_caption_clips(caption_text, caption_position, render_duration, output_path.parent / f"{output_path.stem}_captions")
+    if tts_word_timings:
+        caption_clips = create_tts_word_caption_clips(tts_word_timings, caption_position, render_duration, output_path.parent / f"{output_path.stem}_tts_captions")
+    else:
+        caption_clips = create_caption_clips(caption_text, caption_position, render_duration, output_path.parent / f"{output_path.stem}_captions")
     layers.extend(caption_clips)
     video = CompositeVideoClip(layers, size=(WIDTH, HEIGHT))
     video = clip_with_audio(video, audio)
@@ -1599,6 +1711,7 @@ def style_digest(style: TextStyle) -> str:
             str(style.date_size),
             str(style.verse_size),
             str(style.reference_size),
+            str(style.verse_line_spacing),
             str(style.glow_strength),
             str(style.shadow_strength),
             str(style.show_date_box),
@@ -1620,6 +1733,8 @@ def render_section(
     background_file,
     music_file,
     narration_file,
+    tts_enabled: bool,
+    tts_voice_gender: str,
     caption_position: str,
     logo_file,
     logo_style: LogoStyle | None,
@@ -1639,6 +1754,8 @@ def render_section(
         str(music_file.size),
         narration_file.name if narration_file else "no-vo",
         str(narration_file.size) if narration_file else "0",
+        str(tts_enabled),
+        tts_voice_gender,
         caption_position,
         logo_file.name if logo_file else "no-logo",
         str(logo_file.size) if logo_file else "0",
@@ -1664,14 +1781,19 @@ def render_section(
 
     if st.button("Create Preview", type="primary", key="bible_create_preview"):
         with st.spinner("Rendering preview..."):
+            render_narration_path = narration_path
+            tts_word_timings = None
+            if tts_enabled:
+                render_narration_path, tts_word_timings = synthesize_tts(details.verse_text, tts_voice_gender, temp_dir / "tts")
             render_video(
                 background_path,
                 text_overlay_path,
                 logo_overlay_path,
                 audio_path,
-                narration_path,
-                details.verse_text if narration_path else None,
+                render_narration_path,
+                details.verse_text if render_narration_path else None,
                 caption_position,
+                tts_word_timings,
                 preview_path,
                 min(details.duration, PREVIEW_DURATION_SECONDS),
                 "2500k",
@@ -1693,14 +1815,19 @@ def render_section(
         approved = st.checkbox("I approve this preview and want to generate the final MP4", key="bible_approve_final")
         if approved and st.button("Generate Final MP4", key="bible_generate_final"):
             with st.spinner("Rendering final YouTube Short..."):
+                render_narration_path = narration_path
+                tts_word_timings = None
+                if tts_enabled:
+                    render_narration_path, tts_word_timings = synthesize_tts(details.verse_text, tts_voice_gender, temp_dir / "tts")
                 render_video(
                     background_path,
                     text_overlay_path,
                     logo_overlay_path,
                     audio_path,
-                    narration_path,
-                    details.verse_text if narration_path else None,
+                    render_narration_path,
+                    details.verse_text if render_narration_path else None,
                     caption_position,
+                    tts_word_timings,
                     final_path,
                     details.duration,
                     "8000k",
@@ -1742,6 +1869,8 @@ def render_batch_section(
     background_files,
     music_files,
     narration_files,
+    tts_enabled: bool,
+    tts_voice_gender: str,
     caption_position: str,
     logo_file,
     logo_style: LogoStyle | None,
@@ -1762,6 +1891,8 @@ def render_batch_section(
         *[f"bg:{file.name}:{file.size}" for file in background_files],
         *[f"music:{file.name}:{file.size}" for file in music_files],
         *[f"vo:{file.name}:{file.size}" for file in narration_files],
+        str(tts_enabled),
+        tts_voice_gender,
         caption_position,
         *[f"{row.date_text}|{row.verse_text}|{row.verse_reference}" for row in batch_rows],
     )
@@ -1794,6 +1925,9 @@ def render_batch_section(
                 background_upload_path = save_upload(background_file, source_dir / f"{index + 1:02d}_{background_file.name}")
                 audio_path = save_upload(music_file, music_dir / f"{index + 1:02d}_{music_file.name}")
                 narration_path = save_upload(narration_file, narration_dir / f"{index + 1:02d}_{narration_file.name}") if narration_file else None
+                tts_word_timings = None
+                if tts_enabled:
+                    narration_path, tts_word_timings = synthesize_tts(row.verse_text, tts_voice_gender, temp_dir / "tts")
                 if is_background_video(background_upload_path):
                     background_path = background_upload_path
                 else:
@@ -1808,6 +1942,7 @@ def render_batch_section(
                     narration_path,
                     row.verse_text if narration_path else None,
                     caption_position,
+                    tts_word_timings,
                     preview_paths[index],
                     min(duration, PREVIEW_DURATION_SECONDS),
                     "2500k",
@@ -1857,6 +1992,9 @@ def render_batch_section(
                         audio_path = save_upload(music_file, audio_path)
                     if narration_file and narration_path and not narration_path.exists():
                         narration_path = save_upload(narration_file, narration_path)
+                    tts_word_timings = None
+                    if tts_enabled:
+                        narration_path, tts_word_timings = synthesize_tts(row.verse_text, tts_voice_gender, temp_dir / "tts")
                     if is_background_video(background_upload_path):
                         background_path = background_upload_path
                     else:
@@ -1871,6 +2009,7 @@ def render_batch_section(
                         narration_path,
                         row.verse_text if narration_path else None,
                         caption_position,
+                        tts_word_timings,
                         final_paths[index],
                         duration,
                         "8000k",
@@ -1937,7 +2076,10 @@ def main() -> None:
         repeat_backgrounds = False
         repeat_music = False
         repeat_narration = False
-        add_narration = st.toggle("Add narration VO audio", value=False)
+        narration_mode = st.selectbox("Narration", ["None", "Upload VO audio", "Text to Speech"], index=0)
+        add_narration = narration_mode != "None"
+        tts_enabled = narration_mode == "Text to Speech"
+        tts_voice_gender = "Female"
         caption_position = "Bottom"
         if batch_mode:
             with st.expander("Batch automation inputs", expanded=True):
@@ -1961,7 +2103,7 @@ def main() -> None:
                     type=["mp3", "wav", "m4a", "aac", "ogg"],
                     accept_multiple_files=True,
                 )
-                if add_narration:
+                if narration_mode == "Upload VO audio":
                     repeat_narration = st.toggle("Repeat uploaded narration VO if fewer than video count", value=False)
                     narration_files = st.file_uploader(
                         f"Upload narration VO file(s){' to repeat' if repeat_narration else f' ({batch_count} required)'}",
@@ -1974,7 +2116,7 @@ def main() -> None:
                 type=["jpg", "jpeg", "png", "webp", "mp4", "mov", "m4v", "webm"],
             )
             music_file = st.file_uploader("Upload background music", type=["mp3", "wav", "m4a", "aac", "ogg"])
-            if add_narration:
+            if narration_mode == "Upload VO audio":
                 narration_file = st.file_uploader("Upload narration VO audio", type=["mp3", "wav", "m4a", "aac", "ogg"])
         if batch_mode:
             music_file = None
@@ -1993,7 +2135,20 @@ def main() -> None:
         if add_narration:
             with st.expander("Closed captions", expanded=True):
                 caption_position = st.selectbox("Caption position", CAPTION_POSITIONS, index=0)
-                st.caption("Captions are generated from the verse text for each video and timed across the narration.")
+                if tts_enabled:
+                    tts_voice_gender = st.radio("TTS voice", ["Female", "Male"], horizontal=True)
+                    sample_col1, sample_col2 = st.columns(2)
+                    with sample_col1:
+                        male_sample = st.file_uploader("Upload male sample voice", type=["mp3", "wav", "m4a", "aac", "ogg"], key="tts_male_sample")
+                        if male_sample:
+                            st.audio(male_sample)
+                    with sample_col2:
+                        female_sample = st.file_uploader("Upload female sample voice", type=["mp3", "wav", "m4a", "aac", "ogg"], key="tts_female_sample")
+                        if female_sample:
+                            st.audio(female_sample)
+                    st.caption("TTS uses free Edge neural voices. Uploaded samples are for preview/reference and are not cloned.")
+                else:
+                    st.caption("Captions are generated from the verse text for each video and timed across the narration.")
 
         with st.expander("Text style", expanded=True):
             font_family = st.selectbox("Font", FONT_FAMILIES, index=0)
@@ -2007,6 +2162,7 @@ def main() -> None:
                 verse_size = st.slider("Verse size", min_value=44, max_value=120, value=82, step=2)
             with col3:
                 reference_size = st.slider("Reference size", min_value=34, max_value=100, value=58, step=2)
+            verse_line_spacing = st.slider("Bible verse interline spacing", min_value=0, max_value=50, value=10, step=1)
             col4, col5 = st.columns(2)
             with col4:
                 glow_strength = st.slider("Text clarity glow", min_value=0, max_value=6, value=2, step=1)
@@ -2066,6 +2222,7 @@ def main() -> None:
             date_size=date_size,
             verse_size=verse_size,
             reference_size=reference_size,
+            verse_line_spacing=verse_line_spacing,
             glow_strength=glow_strength,
             shadow_strength=shadow_strength,
             show_date_box=show_date_box,
@@ -2103,13 +2260,16 @@ def main() -> None:
                 st.error(f"Please upload exactly {batch_count} background music file(s). You uploaded {music_count}.")
             if music_files and repeat_music and music_count < 1:
                 st.error("Please upload at least one background music file to repeat.")
-            if add_narration and narration_files and not repeat_narration and narration_count != int(batch_count):
+            if narration_mode == "Upload VO audio" and narration_files and not repeat_narration and narration_count != int(batch_count):
                 st.error(f"Please upload exactly {batch_count} narration VO file(s). You uploaded {narration_count}.")
-            if add_narration and narration_files and repeat_narration and narration_count < 1:
+            if narration_mode == "Upload VO audio" and narration_files and repeat_narration and narration_count < 1:
                 st.error("Please upload at least one narration VO file to repeat.")
             background_ready = bool(background_files) and (repeat_backgrounds or background_count == int(batch_count))
             music_ready = bool(music_files) and (repeat_music or music_count == int(batch_count))
-            narration_ready = (not add_narration) or (bool(narration_files) and (repeat_narration or narration_count == int(batch_count)))
+            narration_ready = (
+                narration_mode != "Upload VO audio"
+                or (bool(narration_files) and (repeat_narration or narration_count == int(batch_count)))
+            )
             ready = all([batch_sheet_ready, background_ready, music_ready, narration_ready])
             if ready:
                 render_batch_section(
@@ -2117,7 +2277,9 @@ def main() -> None:
                     style,
                     background_files,
                     music_files,
-                    narration_files if add_narration else [],
+                    narration_files if narration_mode == "Upload VO audio" else [],
+                    tts_enabled,
+                    tts_voice_gender,
                     caption_position,
                     logo_file,
                     logo_style,
@@ -2129,7 +2291,7 @@ def main() -> None:
                 st.info("Complete the batch count, Excel sheet, background files, music files, and any requested VO files to begin. Exact counts are required unless repeat is enabled.")
                 st.button("Create Batch Previews", disabled=True, key="batch_preview_disabled_incomplete")
         elif all([background_file, music_file, date_text.strip(), verse_reference.strip(), verse_text.strip()]):
-            if add_narration and not narration_file:
+            if narration_mode == "Upload VO audio" and not narration_file:
                 st.info("Upload narration VO audio or turn off narration.")
                 st.button("Create Preview", disabled=True, key="bible_preview_disabled_no_vo")
                 return
@@ -2144,7 +2306,9 @@ def main() -> None:
                 style,
                 background_file,
                 music_file,
-                narration_file if add_narration else None,
+                narration_file if narration_mode == "Upload VO audio" else None,
+                tts_enabled,
+                tts_voice_gender,
                 caption_position,
                 logo_file,
                 logo_style,
