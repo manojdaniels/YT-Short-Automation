@@ -64,7 +64,14 @@ FONT_FAMILIES = [
     "Playfair Display",
     "Cinzel",
     "Cormorant Garamond",
+    "Lora",
+    "Pinyon Script",
+    "Alice",
     "Montserrat",
+    "Poppins",
+    "Ubuntu",
+    "Italianno",
+    "Merriweather",
     "Helvetica Neue",
     "Sans Serif",
     "Georgia",
@@ -77,7 +84,14 @@ DOWNLOADABLE_FONTS = {
     "Playfair Display": "https://raw.githubusercontent.com/google/fonts/main/ofl/playfairdisplay/PlayfairDisplay%5Bwght%5D.ttf",
     "Cinzel": "https://raw.githubusercontent.com/google/fonts/main/ofl/cinzel/Cinzel%5Bwght%5D.ttf",
     "Cormorant Garamond": "https://raw.githubusercontent.com/google/fonts/main/ofl/cormorantgaramond/CormorantGaramond%5Bwght%5D.ttf",
+    "Lora": "https://raw.githubusercontent.com/google/fonts/main/ofl/lora/Lora%5Bwght%5D.ttf",
+    "Pinyon Script": "https://raw.githubusercontent.com/google/fonts/main/ofl/pinyonscript/PinyonScript-Regular.ttf",
+    "Alice": "https://raw.githubusercontent.com/google/fonts/main/ofl/alice/Alice-Regular.ttf",
     "Montserrat": "https://raw.githubusercontent.com/google/fonts/main/ofl/montserrat/Montserrat%5Bwght%5D.ttf",
+    "Poppins": "https://raw.githubusercontent.com/google/fonts/main/ofl/poppins/Poppins-Regular.ttf",
+    "Ubuntu": "https://raw.githubusercontent.com/google/fonts/main/ufl/ubuntu/Ubuntu-Regular.ttf",
+    "Italianno": "https://raw.githubusercontent.com/google/fonts/main/ofl/italianno/Italianno-Regular.ttf",
+    "Merriweather": "https://raw.githubusercontent.com/google/fonts/main/ofl/merriweather/Merriweather%5Bopsz%2Cwdth%2Cwght%5D.ttf",
 }
 
 VIDEO_DIMENSIONS = {
@@ -115,6 +129,7 @@ class VideoDetails:
 @dataclass(frozen=True)
 class TextStyle:
     font_family: str
+    text_case: str
     text_color: str
     glow_color: str
     date_size: int
@@ -365,9 +380,49 @@ def fit_wrapped_text(
     return font, wrap_text(draw, text, font, max_width), line_gap
 
 
+def sentence_case_text(text: str) -> str:
+    text = " ".join(text.split())
+    if not text:
+        return ""
+    result: list[str] = []
+    capitalize_next = True
+    for char in text.lower():
+        if capitalize_next and char.isalpha():
+            result.append(char.upper())
+            capitalize_next = False
+        else:
+            result.append(char)
+        if char in ".!?":
+            capitalize_next = True
+    return "".join(result)
+
+
+def apply_text_case(text: str, text_case: str) -> str:
+    if text_case == "Uppercase":
+        return text.upper()
+    if text_case == "Sentence case":
+        return sentence_case_text(text)
+    return text
+
+
 def format_reference(reference: str) -> str:
-    normalized = " ".join(reference.upper().split())
+    normalized = " ".join(reference.split())
     return normalized.replace(" :", ":").replace(": ", ":")
+
+
+def text_layout_boxes() -> tuple[tuple[int, int, int, int], tuple[int, int, int, int], tuple[int, int, int, int]]:
+    date_box_height = 125
+    verse_box_height = 585
+    reference_box_height = 115
+    top_margin = 105
+    bottom_margin = 220
+    gap = (HEIGHT - top_margin - bottom_margin - date_box_height - verse_box_height - reference_box_height) // 2
+    date_box = (170, top_margin, 910, top_margin + date_box_height)
+    verse_top = date_box[3] + gap
+    verse_box = (105, verse_top, 975, verse_top + verse_box_height)
+    reference_top = verse_box[3] + gap
+    reference_box = (190, reference_top, 890, reference_top + reference_box_height)
+    return date_box, verse_box, reference_box
 
 
 def draw_centered_text(
@@ -474,9 +529,7 @@ def create_text_overlay(details: VideoDetails, style: TextStyle, output_path: Pa
     glow_draw = ImageDraw.Draw(glow_layer)
     shadow_draw = ImageDraw.Draw(shadow_layer)
 
-    date_box = (170, 105, 910, 230)
-    verse_box = (105, 615, 975, 1200)
-    reference_box = (190, 1585, 890, 1700)
+    date_box, verse_box, reference_box = text_layout_boxes()
 
     if style.show_date_box:
         draw_translucent_box(box_draw, date_box, radius=0, scale=scale)
@@ -490,7 +543,9 @@ def create_text_overlay(details: VideoDetails, style: TextStyle, output_path: Pa
     text_color = hex_to_rgba(style.text_color)
     glow_color = hex_to_rgba(style.glow_color, alpha=185)
     shadow_color = (0, 0, 0, max(0, min(255, style.shadow_strength)))
-    verse_text = details.verse_text.strip()
+    date_text = apply_text_case(details.date_text.strip(), style.text_case)
+    verse_reference = apply_text_case(format_reference(details.verse_reference), style.text_case)
+    verse_text = apply_text_case(details.verse_text.strip(), style.text_case)
     if not (verse_text.startswith('"') or verse_text.startswith("'")):
         verse_text = f'"{verse_text}"'
     verse_font, verse_lines, verse_gap = fit_wrapped_text(
@@ -511,8 +566,8 @@ def create_text_overlay(details: VideoDetails, style: TextStyle, output_path: Pa
         draw,
         glow_draw,
         shadow_draw,
-        wrap_text(draw, details.date_text.upper(), date_font, 940 * scale),
-        132 * scale,
+        wrap_text(draw, date_text, date_font, 940 * scale),
+        (date_box[1] + 27) * scale,
         date_font,
         18 * scale,
         max(1, style.glow_strength * scale),
@@ -540,8 +595,8 @@ def create_text_overlay(details: VideoDetails, style: TextStyle, output_path: Pa
         draw,
         glow_draw,
         shadow_draw,
-        wrap_text(draw, format_reference(details.verse_reference), ref_font, 900 * scale),
-        1612 * scale,
+        wrap_text(draw, verse_reference, ref_font, 900 * scale),
+        (reference_box[1] + 27) * scale,
         ref_font,
         12 * scale,
         max(1, style.glow_strength * scale),
@@ -1538,6 +1593,7 @@ def style_digest(style: TextStyle) -> str:
     return "|".join(
         [
             style.font_family,
+            style.text_case,
             style.text_color,
             style.glow_color,
             str(style.date_size),
@@ -1941,6 +1997,7 @@ def main() -> None:
 
         with st.expander("Text style", expanded=True):
             font_family = st.selectbox("Font", FONT_FAMILIES, index=0)
+            text_case = st.selectbox("Text case", ["Original", "Sentence case", "Uppercase"], index=0)
             text_color = st.color_picker("Text color", "#FFFFFF")
             glow_color = st.color_picker("Soft contrast color", "#FFF4D8")
             col1, col2, col3 = st.columns(3)
@@ -2003,6 +2060,7 @@ def main() -> None:
 
         style = TextStyle(
             font_family=font_family,
+            text_case=text_case,
             text_color=text_color,
             glow_color=glow_color,
             date_size=date_size,
