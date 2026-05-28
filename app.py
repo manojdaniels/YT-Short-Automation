@@ -412,13 +412,18 @@ def apply_text_case(text: str, text_case: str) -> str:
     return text
 
 
-def tts_cache_key(text: str, voice: str) -> str:
-    return file_digest(text, voice)
+def edge_tts_rate(speed_percent: int) -> str:
+    prefix = "+" if speed_percent >= 0 else ""
+    return f"{prefix}{speed_percent}%"
 
 
-async def synthesize_tts_async(text: str, voice: str, output_path: Path) -> list[dict]:
+def tts_cache_key(text: str, voice: str, speed_percent: int) -> str:
+    return file_digest(text, voice, str(speed_percent))
+
+
+async def synthesize_tts_async(text: str, voice: str, speed_percent: int, output_path: Path) -> list[dict]:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    communicate = edge_tts.Communicate(text, voice)
+    communicate = edge_tts.Communicate(text, voice, rate=edge_tts_rate(speed_percent))
     word_timings: list[dict] = []
     audio_chunks: list[bytes] = []
     async for chunk in communicate.stream():
@@ -436,16 +441,23 @@ async def synthesize_tts_async(text: str, voice: str, output_path: Path) -> list
     return word_timings
 
 
-def synthesize_tts(text: str, voice_gender: str, output_dir: Path) -> tuple[Path, list[dict]]:
+def synthesize_tts(text: str, voice_gender: str, speed_percent: int, output_dir: Path) -> tuple[Path, list[dict]]:
     voice = TTS_VOICES[voice_gender]
-    key = tts_cache_key(text, voice)
-    audio_path = output_dir / f"tts_{voice_gender.lower()}_{key}.mp3"
-    timings_path = output_dir / f"tts_{voice_gender.lower()}_{key}.json"
+    key = tts_cache_key(text, voice, speed_percent)
+    speed_label = f"{speed_percent:+d}".replace("+", "plus").replace("-", "minus")
+    audio_path = output_dir / f"tts_{voice_gender.lower()}_{speed_label}_{key}.mp3"
+    timings_path = output_dir / f"tts_{voice_gender.lower()}_{speed_label}_{key}.json"
     if audio_path.exists() and timings_path.exists():
         return audio_path, pd.read_json(timings_path).to_dict("records")
-    word_timings = asyncio.run(synthesize_tts_async(text, voice, audio_path))
+    word_timings = asyncio.run(synthesize_tts_async(text, voice, speed_percent, audio_path))
     pd.DataFrame(word_timings).to_json(timings_path, orient="records")
     return audio_path, word_timings
+
+
+def tts_duration_from_timings(word_timings: list[dict]) -> float:
+    if not word_timings:
+        return 0.0
+    return max(float(item.get("start", 0)) + float(item.get("duration", 0)) for item in word_timings)
 
 
 def format_reference(reference: str) -> str:
@@ -1745,6 +1757,7 @@ def render_section(
     narration_file,
     tts_enabled: bool,
     tts_voice_gender: str,
+    tts_speed_percent: int,
     caption_position: str,
     logo_file,
     logo_style: LogoStyle | None,
@@ -1766,6 +1779,7 @@ def render_section(
         str(narration_file.size) if narration_file else "0",
         str(tts_enabled),
         tts_voice_gender,
+        str(tts_speed_percent),
         caption_position,
         logo_file.name if logo_file else "no-logo",
         str(logo_file.size) if logo_file else "0",
@@ -1794,7 +1808,7 @@ def render_section(
             render_narration_path = narration_path
             tts_word_timings = None
             if tts_enabled:
-                render_narration_path, tts_word_timings = synthesize_tts(details.verse_text, tts_voice_gender, temp_dir / "tts")
+                render_narration_path, tts_word_timings = synthesize_tts(details.verse_text, tts_voice_gender, tts_speed_percent, temp_dir / "tts")
             render_video(
                 background_path,
                 text_overlay_path,
@@ -1828,7 +1842,7 @@ def render_section(
                 render_narration_path = narration_path
                 tts_word_timings = None
                 if tts_enabled:
-                    render_narration_path, tts_word_timings = synthesize_tts(details.verse_text, tts_voice_gender, temp_dir / "tts")
+                    render_narration_path, tts_word_timings = synthesize_tts(details.verse_text, tts_voice_gender, tts_speed_percent, temp_dir / "tts")
                 render_video(
                     background_path,
                     text_overlay_path,
@@ -1881,6 +1895,7 @@ def render_batch_section(
     narration_files,
     tts_enabled: bool,
     tts_voice_gender: str,
+    tts_speed_percent: int,
     caption_position: str,
     logo_file,
     logo_style: LogoStyle | None,
@@ -1903,6 +1918,7 @@ def render_batch_section(
         *[f"vo:{file.name}:{file.size}" for file in narration_files],
         str(tts_enabled),
         tts_voice_gender,
+        str(tts_speed_percent),
         caption_position,
         *[f"{row.date_text}|{row.verse_text}|{row.verse_reference}" for row in batch_rows],
     )
@@ -1937,7 +1953,7 @@ def render_batch_section(
                 narration_path = save_upload(narration_file, narration_dir / f"{index + 1:02d}_{narration_file.name}") if narration_file else None
                 tts_word_timings = None
                 if tts_enabled:
-                    narration_path, tts_word_timings = synthesize_tts(row.verse_text, tts_voice_gender, temp_dir / "tts")
+                    narration_path, tts_word_timings = synthesize_tts(row.verse_text, tts_voice_gender, tts_speed_percent, temp_dir / "tts")
                 if is_background_video(background_upload_path):
                     background_path = background_upload_path
                 else:
@@ -2004,7 +2020,7 @@ def render_batch_section(
                         narration_path = save_upload(narration_file, narration_path)
                     tts_word_timings = None
                     if tts_enabled:
-                        narration_path, tts_word_timings = synthesize_tts(row.verse_text, tts_voice_gender, temp_dir / "tts")
+                        narration_path, tts_word_timings = synthesize_tts(row.verse_text, tts_voice_gender, tts_speed_percent, temp_dir / "tts")
                     if is_background_video(background_upload_path):
                         background_path = background_upload_path
                     else:
@@ -2090,6 +2106,7 @@ def main() -> None:
         add_narration = narration_mode != "None"
         tts_enabled = narration_mode == "Text to Speech"
         tts_voice_gender = "Female"
+        tts_speed_percent = 0
         caption_position = "Bottom"
         if batch_mode:
             with st.expander("Batch automation inputs", expanded=True):
@@ -2147,6 +2164,15 @@ def main() -> None:
                 caption_position = st.selectbox("Caption position", CAPTION_POSITIONS, index=0)
                 if tts_enabled:
                     tts_voice_gender = st.radio("TTS voice", ["Female", "Male"], horizontal=True)
+                    tts_speed_percent = st.slider(
+                        "TTS speed",
+                        min_value=-50,
+                        max_value=25,
+                        value=-15,
+                        step=5,
+                        help="Negative values slow the voice down. Example: -20% is slower than normal.",
+                    )
+                    st.caption(f"Selected TTS rate: {edge_tts_rate(tts_speed_percent)}")
                     sample_col1, sample_col2 = st.columns(2)
                     with sample_col1:
                         male_sample = st.file_uploader("Upload male sample voice", type=["mp3", "wav", "m4a", "aac", "ogg"], key="tts_male_sample")
@@ -2156,6 +2182,12 @@ def main() -> None:
                         female_sample = st.file_uploader("Upload female sample voice", type=["mp3", "wav", "m4a", "aac", "ogg"], key="tts_female_sample")
                         if female_sample:
                             st.audio(female_sample)
+                    sample_text = verse_text.strip() if not batch_mode else "The Lord is my shepherd; I shall not want."
+                    if st.button("Generate TTS sample", key="tts_generate_sample"):
+                        with st.spinner("Generating TTS sample..."):
+                            sample_audio_path, sample_timings = synthesize_tts(sample_text, tts_voice_gender, tts_speed_percent, WORK_DIR / "tts_samples")
+                        st.audio(str(sample_audio_path))
+                        st.write({"tts_duration_seconds": round(tts_duration_from_timings(sample_timings), 2)})
                     st.caption("TTS uses free Edge neural voices. Uploaded samples are for preview/reference and are not cloned.")
                 else:
                     st.caption("Captions are generated from the verse text for each video and timed across the narration.")
@@ -2290,6 +2322,7 @@ def main() -> None:
                     narration_files if narration_mode == "Upload VO audio" else [],
                     tts_enabled,
                     tts_voice_gender,
+                    tts_speed_percent,
                     caption_position,
                     logo_file,
                     logo_style,
@@ -2319,6 +2352,7 @@ def main() -> None:
                 narration_file if narration_mode == "Upload VO audio" else None,
                 tts_enabled,
                 tts_voice_gender,
+                tts_speed_percent,
                 caption_position,
                 logo_file,
                 logo_style,
