@@ -858,6 +858,12 @@ def clip_with_audio(video, audio):
     return video.with_audio(audio) if hasattr(video, "with_audio") else video.set_audio(audio)
 
 
+def safe_audio_subclip(audio_clip, duration: float):
+    clip_duration = audio_clip.duration or duration
+    end_time = max(0.01, min(duration, clip_duration))
+    return audio_clip.subclipped(0, end_time) if hasattr(audio_clip, "subclipped") else audio_clip.subclip(0, end_time)
+
+
 def clip_without_audio(video):
     return video.without_audio() if hasattr(video, "without_audio") else video.set_audio(None)
 
@@ -967,16 +973,18 @@ def render_video(
     audio_clip = AudioFileClip(str(audio_path))
     render_duration = min(duration, MAX_DURATION_SECONDS, audio_clip.duration or MAX_DURATION_SECONDS)
 
-    music_audio = audio_clip.subclipped(0, render_duration) if hasattr(audio_clip, "subclipped") else audio_clip.subclip(0, render_duration)
+    music_audio = safe_audio_subclip(audio_clip, render_duration)
     background, background_source = create_background_clip(background_path, render_duration, include_background_video_audio)
     audio_layers = [music_audio]
+    extra_audio_clips = [music_audio]
     if include_background_video_audio and getattr(background, "audio", None):
         audio_layers.append(background.audio)
     narration_clip = None
     if narration_path:
         narration_clip = AudioFileClip(str(narration_path))
-        narration_audio = narration_clip.subclipped(0, render_duration) if hasattr(narration_clip, "subclipped") else narration_clip.subclip(0, render_duration)
+        narration_audio = safe_audio_subclip(narration_clip, render_duration)
         audio_layers.append(narration_audio)
+        extra_audio_clips.append(narration_audio)
     audio = CompositeAudioClip(audio_layers) if len(audio_layers) > 1 else music_audio
     audio = apply_audio_fade_out(audio, render_duration)
 
@@ -1007,6 +1015,8 @@ def render_video(
     write_mp4_with_gpu_fallback(video, output_path, FPS, bitrate, use_gpu=use_gpu, audio_codec="aac")
 
     audio.close()
+    for extra_audio in extra_audio_clips:
+        extra_audio.close()
     audio_clip.close()
     background.close()
     if background_source:
